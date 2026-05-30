@@ -1,0 +1,270 @@
+name: secure-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Ref or version label passed to the encrypted build payload.
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secure-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Private build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - target: windows
+            runner: windows-latest
+          - target: macos-x86_64
+            runner: macos-15-intel
+          - target: macos-arm64
+            runner: macos-15
+    env:
+      ENCRYPTED_PAYLOAD: encrypted/payload.tar.gz.age
+      PAYLOAD_DIR: .payload/${{ matrix.target }}
+      OUTPUT_DIR: .release-output/${{ matrix.target }}
+      CI_OUTPUT_LOG: .ci-output/${{ matrix.target }}/ci-output.log
+      CI_OUTPUT_ENCRYPTED: .ci-output/${{ matrix.target }}/ci-output.log.age
+      PRIVATE_BUILD_TARGET: ${{ matrix.target }}
+      RELEASE_REF: ${{ inputs.release_ref || github.ref_name }}
+
+    steps:
+      - name: Checkout encrypted source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release configuration
+        shell: bash
+        env:
+          AGE_SECRET_KEY: ${{ secrets.AGE_SECRET_KEY }}
+          DESTINATION_REPOSITORY: ${{ secrets.DESTINATION_REPOSITORY }}
+          DESTINATION_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+          CI_OUTPUT_AGE_RECIPIENT: ${{ secrets.CI_OUTPUT_AGE_RECIPIENT || vars.CI_OUTPUT_AGE_RECIPIENT }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          : > "${CI_OUTPUT_LOG}"
+
+          for name in AGE_SECRET_KEY DESTINATION_REPOSITORY DESTINATION_TOKEN CI_OUTPUT_AGE_RECIPIENT; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Required secret or variable ${name} is not configured."
+              exit 1
+            fi
+          done
+
+          if [ ! -f "${ENCRYPTED_PAYLOAD}" ]; then
+            echo "::error::Encrypted payload is missing at ${ENCRYPTED_PAYLOAD}."
+            exit 1
+          fi
+
+          if [[ ! "${RELEASE_REF}" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+            echo "::error::RELEASE_REF must be a release tag like v1.2.3."
+            exit 1
+          fi
+
+      - name: Install decrypt tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}" in
+            Linux)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq age
+              ;;
+            macOS)
+              brew install age
+              ;;
+            Windows)
+              powershell.exe -NoLogo -NoProfile -Command "choco install age.portable --no-progress -y"
+              echo 'C:\ProgramData\chocolatey\bin' >> "${GITHUB_PATH}"
+              export PATH="${PATH}:/c/ProgramData/chocolatey/bin"
+              ;;
+            *)
+              echo "::error::Unsupported runner OS: ${RUNNER_OS}"
+              exit 1
+              ;;
+          esac
+          age --version
+
+      - name: Decrypt build payload
+        shell: bash
+        env:
+          AGE_SECRET_KEY: ${{ secrets.AGE_SECRET_KEY }}
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "::error::Decrypting build payload failed. Details are in encrypted CI output."; exit 1' ERR
+
+          identity_file="${RUNNER_TEMP}/age-identity.txt"
+          archive_file="${RUNNER_TEMP}/payload.tar.gz"
+
+          install -m 700 -d "${RUNNER_TEMP}/secure-release"
+          printf '%s\n' "${AGE_SECRET_KEY}" > "${identity_file}"
+          chmod 600 "${identity_file}"
+
+          mkdir -p "${PAYLOAD_DIR}" "${OUTPUT_DIR}"
+          {
+            echo "== decrypt build payload =="
+            age --decrypt \
+              --identity "${identity_file}" \
+              --output "${archive_file}" \
+              "${ENCRYPTED_PAYLOAD}"
+
+            tar -xzf "${archive_file}" -C "${PAYLOAD_DIR}"
+          } >> "${CI_OUTPUT_LOG}" 2>&1
+
+          rm -f "${archive_file}" "${identity_file}"
+
+          if [ ! -f "${PAYLOAD_DIR}/ci/build.sh" ]; then
+            echo "::error::Decrypted payload must contain ci/build.sh."
+            exit 1
+          fi
+
+      - name: Run private build
+        shell: bash
+        env:
+          BUILD_ENV_B64: ${{ secrets.BUILD_ENV_B64 }}
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "::error::Build failed. Details are in encrypted CI output."; exit 1' ERR
+
+          {
+            echo "== run private build =="
+
+            if [ -n "${BUILD_ENV_B64:-}" ]; then
+              build_env_file="${RUNNER_TEMP}/build.env"
+              printf '%s' "${BUILD_ENV_B64}" | base64 -d > "${build_env_file}"
+              set -a
+              # shellcheck disable=SC1090
+              . "${build_env_file}"
+              set +a
+              rm -f "${build_env_file}"
+            fi
+
+            export RELEASE_OUTPUT_DIR="${OUTPUT_DIR}"
+            export RELEASE_PAYLOAD_DIR="${PAYLOAD_DIR}"
+            export RELEASE_SOURCE_REPOSITORY="${GITHUB_REPOSITORY}"
+            export RELEASE_SOURCE_SHA="${GITHUB_SHA}"
+            export PRIVATE_BUILD_TARGET="${PRIVATE_BUILD_TARGET}"
+            export RELEASE_REF="${RELEASE_REF:-${GITHUB_REF_NAME}}"
+
+            bash "${PAYLOAD_DIR}/ci/build.sh"
+          } >> "${CI_OUTPUT_LOG}" 2>&1
+
+          if [ ! -d "${OUTPUT_DIR}" ] || [ -z "$(find "${OUTPUT_DIR}" -mindepth 1 -print -quit)" ]; then
+            echo "::error::Private build produced no publishable output."
+            exit 1
+          fi
+
+      - name: Publish output to private repository
+        shell: bash
+        env:
+          DESTINATION_REPOSITORY: ${{ secrets.DESTINATION_REPOSITORY }}
+          DESTINATION_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+          DESTINATION_TARGET: ${{ secrets.DESTINATION_TARGET }}
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "::error::Publishing to private repository failed. Details are in encrypted CI output."; exit 1' ERR
+
+          {
+            echo "== publish release assets =="
+
+            export GH_TOKEN="${DESTINATION_TOKEN}"
+            release_tag="${RELEASE_REF}"
+            release_target="${DESTINATION_TARGET:-}"
+
+            if [ -z "${release_target}" ]; then
+              release_target="$(gh repo view "${DESTINATION_REPOSITORY}" --json defaultBranchRef --jq '.defaultBranchRef.name')"
+            fi
+
+            if [ -z "${release_target}" ] || [ "${release_target}" = "null" ]; then
+              echo "Destination repository has no default branch. Configure DESTINATION_TARGET."
+              exit 1
+            fi
+
+            if ! gh release view "${release_tag}" --repo "${DESTINATION_REPOSITORY}" >/dev/null 2>&1; then
+              gh release create "${release_tag}" \
+                --repo "${DESTINATION_REPOSITORY}" \
+                --target "${release_target}" \
+                --title "${release_tag}" \
+                --notes "Built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}."
+            fi
+
+            mapfile -t release_files < <(find "${OUTPUT_DIR}" -type f)
+            if [ "${#release_files[@]}" -eq 0 ]; then
+              echo "No release files found."
+              exit 1
+            fi
+
+            gh release upload "${release_tag}" "${release_files[@]}" \
+              --repo "${DESTINATION_REPOSITORY}" \
+              --clobber
+          } >> "${CI_OUTPUT_LOG}" 2>&1
+
+          echo "Published release assets to the configured private repository release."
+
+      - name: Encrypt CI output
+        if: always()
+        shell: bash
+        env:
+          CI_OUTPUT_AGE_RECIPIENT: ${{ secrets.CI_OUTPUT_AGE_RECIPIENT || vars.CI_OUTPUT_AGE_RECIPIENT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CI_OUTPUT_AGE_RECIPIENT:-}" ]; then
+            echo "::error::Required secret or variable CI_OUTPUT_AGE_RECIPIENT is not configured."
+            exit 1
+          fi
+
+          if ! command -v age >/dev/null 2>&1; then
+            case "${RUNNER_OS}" in
+              Linux)
+                sudo apt-get update -qq
+                sudo apt-get install -y -qq age
+                ;;
+              macOS)
+                brew install age
+                ;;
+              Windows)
+                powershell.exe -NoLogo -NoProfile -Command "choco install age.portable --no-progress -y"
+                echo 'C:\ProgramData\chocolatey\bin' >> "${GITHUB_PATH}"
+                export PATH="${PATH}:/c/ProgramData/chocolatey/bin"
+                ;;
+              *)
+                echo "::error::Unsupported runner OS: ${RUNNER_OS}"
+                exit 1
+                ;;
+            esac
+          fi
+
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          if [ ! -s "${CI_OUTPUT_LOG}" ]; then
+            printf 'No captured sensitive CI output.\n' > "${CI_OUTPUT_LOG}"
+          fi
+
+          age -r "${CI_OUTPUT_AGE_RECIPIENT}" -o "${CI_OUTPUT_ENCRYPTED}" "${CI_OUTPUT_LOG}"
+          rm -f "${CI_OUTPUT_LOG}"
+
+      - name: Upload encrypted CI output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-ci-output-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CI_OUTPUT_ENCRYPTED }}
+          if-no-files-found: ignore
+          retention-days: 30

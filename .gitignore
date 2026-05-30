@@ -1,0 +1,12 @@
+.payload/
+.release-output/
+.ci-output/
+private-release-repo/
+payload/
+scripts/
+age.key
+build.env
+*.log
+*.tar
+*.tar.gz
+*.tmp
