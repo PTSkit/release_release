@@ -73,11 +73,6 @@ jobs:
             exit 1
           fi
 
-          if [[ ! "${RELEASE_REF}" =~ ^v[0-9A-Za-z._-]+$ ]]; then
-            echo "::error::RELEASE_REF must be a release tag like v1.2.3."
-            exit 1
-          fi
-
       - name: Install decrypt tool
         shell: bash
         run: |
