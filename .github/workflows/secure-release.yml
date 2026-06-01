@@ -15,11 +15,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: secure-release-${{ github.ref }}
+  group: secure-release-${{ inputs.release_ref || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
     name: Private build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -38,6 +38,7 @@ jobs:
       ENCRYPTED_PAYLOAD: encrypted/payload.tar.gz.age
       PAYLOAD_DIR: .payload/${{ matrix.target }}
       OUTPUT_DIR: .release-output/${{ matrix.target }}
+      OUTPUT_ARCHIVE_ENCRYPTED: .release-output-encrypted/${{ matrix.target }}/release-output-${{ matrix.target }}.tar.gz.age
       CI_OUTPUT_LOG: .ci-output/${{ matrix.target }}/ci-output.log
       CI_OUTPUT_ENCRYPTED: .ci-output/${{ matrix.target }}/ci-output.log.age
       PRIVATE_BUILD_TARGET: ${{ matrix.target }}
@@ -172,57 +173,42 @@ jobs:
             exit 1
           fi
 
-      - name: Publish output to private repository
+      - name: Encrypt release output
         shell: bash
         env:
-          DESTINATION_REPOSITORY: ${{ secrets.DESTINATION_REPOSITORY }}
-          DESTINATION_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
-          DESTINATION_TARGET: ${{ secrets.DESTINATION_TARGET }}
+          AGE_SECRET_KEY: ${{ secrets.AGE_SECRET_KEY }}
         run: |
           set -Eeuo pipefail
-          trap 'echo "::error::Publishing to private repository failed. Details are in encrypted CI output."; exit 1' ERR
+          trap 'echo "::error::Encrypting release output failed. Details are in encrypted CI output."; exit 1' ERR
+
+          secure_dir=".secure-release-output/${PRIVATE_BUILD_TARGET}"
+          identity_file="${secure_dir}/age-identity.txt"
+          recipient_file="${secure_dir}/age-recipient.txt"
+          archive_file="${secure_dir}/release-output-${PRIVATE_BUILD_TARGET}.tar.gz"
+
+          rm -rf "${secure_dir}"
+          mkdir -p "${secure_dir}" "$(dirname "${OUTPUT_ARCHIVE_ENCRYPTED}")"
+          printf '%s\n' "${AGE_SECRET_KEY}" > "${identity_file}"
+          if [ "${RUNNER_OS}" != "Windows" ]; then
+            chmod 600 "${identity_file}"
+          fi
 
           {
-            echo "== publish release assets =="
-
-            export GH_TOKEN="${DESTINATION_TOKEN}"
-            release_tag="${RELEASE_REF}"
-            release_target="${DESTINATION_TARGET:-}"
-
-            if [ -z "${release_target}" ]; then
-              release_target="$(gh repo view "${DESTINATION_REPOSITORY}" --json defaultBranchRef --jq '.defaultBranchRef.name')"
-            fi
-
-            if [ -z "${release_target}" ] || [ "${release_target}" = "null" ]; then
-              echo "Destination repository has no default branch. Configure DESTINATION_TARGET."
-              exit 1
-            fi
-
-            if ! gh release view "${release_tag}" --repo "${DESTINATION_REPOSITORY}" >/dev/null 2>&1; then
-              if ! gh release create "${release_tag}" \
-                --repo "${DESTINATION_REPOSITORY}" \
-                --target "${release_target}" \
-                --title "${release_tag}" \
-                --notes "Built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}."; then
-                gh release view "${release_tag}" --repo "${DESTINATION_REPOSITORY}" >/dev/null
-              fi
-            fi
-
-            release_files_file="${RUNNER_TEMP}/release-files-${PRIVATE_BUILD_TARGET}.txt"
-            find "${OUTPUT_DIR}" -type f -print > "${release_files_file}"
-            if [ ! -s "${release_files_file}" ]; then
-              echo "No release files found."
-              exit 1
-            fi
-
-            while IFS= read -r release_file; do
-              gh release upload "${release_tag}" "${release_file}" \
-                --repo "${DESTINATION_REPOSITORY}" \
-                --clobber
-            done < "${release_files_file}"
+            echo "== encrypt release output =="
+            age-keygen -y "${identity_file}" > "${recipient_file}"
+            tar -czf "${archive_file}" -C "${OUTPUT_DIR}" .
+            age -r "$(cat "${recipient_file}")" -o "${OUTPUT_ARCHIVE_ENCRYPTED}" "${archive_file}"
           } >> "${CI_OUTPUT_LOG}" 2>&1
 
-          echo "Published release assets to the configured private repository release."
+          rm -rf "${secure_dir}"
+
+      - name: Upload encrypted release output
+        uses: actions/upload-artifact@v6
+        with:
+          name: encrypted-release-output-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.OUTPUT_ARCHIVE_ENCRYPTED }}
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Encrypt CI output
         if: always()
@@ -271,6 +257,175 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: encrypted-ci-output-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CI_OUTPUT_ENCRYPTED }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  publish:
+    name: Publish release outputs
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DOWNLOADED_OUTPUTS_DIR: .release-output-encrypted
+      PUBLISH_DIR: .publish-output
+      CI_OUTPUT_LOG: .ci-output/publish/ci-output.log
+      CI_OUTPUT_ENCRYPTED: .ci-output/publish/ci-output.log.age
+      RELEASE_REF: ${{ inputs.release_ref || github.ref_name }}
+    steps:
+      - name: Download encrypted release outputs
+        uses: actions/download-artifact@v6
+        with:
+          pattern: encrypted-release-output-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.DOWNLOADED_OUTPUTS_DIR }}
+          merge-multiple: true
+
+      - name: Install decrypt tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v age >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq age
+          fi
+          age --version
+
+      - name: Decrypt release outputs
+        shell: bash
+        env:
+          AGE_SECRET_KEY: ${{ secrets.AGE_SECRET_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          secure_dir=".secure-publish"
+          identity_file="${secure_dir}/age-identity.txt"
+          rm -rf "${secure_dir}" "${PUBLISH_DIR}"
+          mkdir -p "${secure_dir}" "${PUBLISH_DIR}"
+          printf '%s\n' "${AGE_SECRET_KEY}" > "${identity_file}"
+          chmod 600 "${identity_file}"
+
+          shopt -s nullglob
+          encrypted_archives=("${DOWNLOADED_OUTPUTS_DIR}"/release-output-*.tar.gz.age)
+          if [ "${#encrypted_archives[@]}" -eq 0 ]; then
+            echo "::error::No encrypted release output artifacts were downloaded."
+            exit 1
+          fi
+
+          for encrypted_archive in "${encrypted_archives[@]}"; do
+            archive_name="$(basename "${encrypted_archive}")"
+            target="${archive_name#release-output-}"
+            target="${target%.tar.gz.age}"
+            target_dir="${PUBLISH_DIR}/${target}"
+            archive_file="${secure_dir}/${target}.tar.gz"
+            mkdir -p "${target_dir}"
+            age --decrypt --identity "${identity_file}" --output "${archive_file}" "${encrypted_archive}"
+            tar -xzf "${archive_file}" -C "${target_dir}"
+          done
+
+          rm -rf "${secure_dir}"
+
+          if [ -z "$(find "${PUBLISH_DIR}" -type f -print -quit)" ]; then
+            echo "::error::Decrypted release outputs are empty."
+            exit 1
+          fi
+
+      - name: Publish output to private repository
+        shell: bash
+        env:
+          DESTINATION_REPOSITORY: ${{ secrets.DESTINATION_REPOSITORY }}
+          DESTINATION_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+          DESTINATION_TARGET: ${{ secrets.DESTINATION_TARGET }}
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "::error::Publishing to private repository failed. Details are in encrypted CI output."; exit 1' ERR
+
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          {
+            echo "== publish release assets =="
+
+            export GH_TOKEN="${DESTINATION_TOKEN}"
+            release_tag="${RELEASE_REF}"
+            release_target="${DESTINATION_TARGET:-}"
+
+            if [ -z "${release_target}" ]; then
+              release_target="$(gh repo view "${DESTINATION_REPOSITORY}" --json defaultBranchRef --jq '.defaultBranchRef.name')"
+            fi
+
+            if [ -z "${release_target}" ] || [ "${release_target}" = "null" ]; then
+              echo "Destination repository has no default branch. Configure DESTINATION_TARGET."
+              exit 1
+            fi
+
+            echo "Cleaning existing private release assets before publishing ${release_tag}."
+            gh release list --repo "${DESTINATION_REPOSITORY}" --limit 1000 --json tagName --jq '.[].tagName' |
+              while IFS= read -r existing_tag; do
+                if [ -n "${existing_tag}" ]; then
+                  gh release view "${existing_tag}" \
+                    --repo "${DESTINATION_REPOSITORY}" \
+                    --json assets \
+                    --jq '.assets[].name' |
+                    while IFS= read -r asset_name; do
+                      if [ -n "${asset_name}" ]; then
+                        gh release delete-asset "${existing_tag}" "${asset_name}" \
+                          --repo "${DESTINATION_REPOSITORY}" \
+                          --yes
+                      fi
+                    done
+                fi
+              done
+
+            if ! gh release view "${release_tag}" --repo "${DESTINATION_REPOSITORY}" >/dev/null 2>&1; then
+              if ! gh release create "${release_tag}" \
+                --repo "${DESTINATION_REPOSITORY}" \
+                --target "${release_target}" \
+                --title "${release_tag}" \
+                --notes "Built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}."; then
+                gh release view "${release_tag}" --repo "${DESTINATION_REPOSITORY}" >/dev/null
+              fi
+            fi
+
+            release_files_file="${RUNNER_TEMP}/release-files.txt"
+            find "${PUBLISH_DIR}" -type f -print > "${release_files_file}"
+            if [ ! -s "${release_files_file}" ]; then
+              echo "No release files found."
+              exit 1
+            fi
+
+            while IFS= read -r release_file; do
+              gh release upload "${release_tag}" "${release_file}" \
+                --repo "${DESTINATION_REPOSITORY}" \
+                --clobber
+            done < "${release_files_file}"
+          } >> "${CI_OUTPUT_LOG}" 2>&1
+
+          echo "Published release assets to the configured private repository release."
+
+      - name: Encrypt CI output
+        if: always()
+        shell: bash
+        env:
+          CI_OUTPUT_AGE_RECIPIENT: ${{ secrets.CI_OUTPUT_AGE_RECIPIENT || vars.CI_OUTPUT_AGE_RECIPIENT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CI_OUTPUT_AGE_RECIPIENT:-}" ]; then
+            echo "::error::Required secret or variable CI_OUTPUT_AGE_RECIPIENT is not configured."
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          if [ ! -s "${CI_OUTPUT_LOG}" ]; then
+            printf 'No captured sensitive CI output.\n' > "${CI_OUTPUT_LOG}"
+          fi
+
+          age -r "${CI_OUTPUT_AGE_RECIPIENT}" -o "${CI_OUTPUT_ENCRYPTED}" "${CI_OUTPUT_LOG}"
+          rm -f "${CI_OUTPUT_LOG}"
+
+      - name: Upload encrypted CI output
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: encrypted-ci-output-publish-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.CI_OUTPUT_ENCRYPTED }}
           if-no-files-found: ignore
           retention-days: 30
