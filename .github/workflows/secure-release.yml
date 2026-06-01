@@ -206,15 +206,18 @@ jobs:
                 --notes "Built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}."
             fi
 
-            mapfile -t release_files < <(find "${OUTPUT_DIR}" -type f)
-            if [ "${#release_files[@]}" -eq 0 ]; then
+            release_files_file="${RUNNER_TEMP}/release-files-${PRIVATE_BUILD_TARGET}.txt"
+            find "${OUTPUT_DIR}" -type f -print > "${release_files_file}"
+            if [ ! -s "${release_files_file}" ]; then
               echo "No release files found."
               exit 1
             fi
 
-            gh release upload "${release_tag}" "${release_files[@]}" \
-              --repo "${DESTINATION_REPOSITORY}" \
-              --clobber
+            while IFS= read -r release_file; do
+              gh release upload "${release_tag}" "${release_file}" \
+                --repo "${DESTINATION_REPOSITORY}" \
+                --clobber
+            done < "${release_files_file}"
           } >> "${CI_OUTPUT_LOG}" 2>&1
 
           echo "Published release assets to the configured private repository release."
