@@ -45,7 +45,7 @@ jobs:
 
     steps:
       - name: Checkout encrypted source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
@@ -82,24 +82,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "${RUNNER_OS}" in
-            Linux)
-              sudo apt-get update -qq
-              sudo apt-get install -y -qq age
-              ;;
-            macOS)
-              brew install age
-              ;;
-            Windows)
-              powershell.exe -NoLogo -NoProfile -Command "choco install age.portable --no-progress -y"
-              echo 'C:\ProgramData\chocolatey\bin' >> "${GITHUB_PATH}"
-              export PATH="${PATH}:/c/ProgramData/chocolatey/bin"
-              ;;
-            *)
-              echo "::error::Unsupported runner OS: ${RUNNER_OS}"
-              exit 1
-              ;;
-          esac
+          if ! command -v age >/dev/null 2>&1; then
+            case "${RUNNER_OS}" in
+              Linux)
+                sudo apt-get update -qq
+                sudo apt-get install -y -qq age
+                ;;
+              macOS)
+                brew install age
+                ;;
+              Windows)
+                powershell.exe -NoLogo -NoProfile -Command "choco install age.portable --no-progress -y"
+                echo 'C:\ProgramData\chocolatey\bin' >> "${GITHUB_PATH}"
+                export PATH="${PATH}:/c/ProgramData/chocolatey/bin"
+                ;;
+              *)
+                echo "::error::Unsupported runner OS: ${RUNNER_OS}"
+                exit 1
+                ;;
+            esac
+          fi
           age --version
 
       - name: Decrypt build payload
@@ -110,12 +112,16 @@ jobs:
           set -Eeuo pipefail
           trap 'echo "::error::Decrypting build payload failed. Details are in encrypted CI output."; exit 1' ERR
 
-          identity_file="${RUNNER_TEMP}/age-identity.txt"
-          archive_file="${RUNNER_TEMP}/payload.tar.gz"
+          secure_dir=".secure-release/${PRIVATE_BUILD_TARGET}"
+          identity_file="${secure_dir}/age-identity.txt"
+          archive_file="${secure_dir}/payload.tar.gz"
 
-          install -m 700 -d "${RUNNER_TEMP}/secure-release"
+          rm -rf "${secure_dir}"
+          mkdir -p "${secure_dir}"
           printf '%s\n' "${AGE_SECRET_KEY}" > "${identity_file}"
-          chmod 600 "${identity_file}"
+          if [ "${RUNNER_OS}" != "Windows" ]; then
+            chmod 600 "${identity_file}"
+          fi
 
           mkdir -p "${PAYLOAD_DIR}" "${OUTPUT_DIR}"
           {
@@ -128,7 +134,7 @@ jobs:
             tar -xzf "${archive_file}" -C "${PAYLOAD_DIR}"
           } >> "${CI_OUTPUT_LOG}" 2>&1
 
-          rm -f "${archive_file}" "${identity_file}"
+          rm -rf "${secure_dir}"
 
           if [ ! -f "${PAYLOAD_DIR}/ci/build.sh" ]; then
             echo "::error::Decrypted payload must contain ci/build.sh."
@@ -262,7 +268,7 @@ jobs:
 
       - name: Upload encrypted CI output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: encrypted-ci-output-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.CI_OUTPUT_ENCRYPTED }}
