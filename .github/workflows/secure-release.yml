@@ -429,3 +429,43 @@ jobs:
           path: ${{ env.CI_OUTPUT_ENCRYPTED }}
           if-no-files-found: ignore
           retention-days: 30
+
+  cleanup-release-output-artifacts:
+    name: Delete encrypted release output artifacts
+    needs:
+      - build
+      - publish
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete encrypted release output artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          artifact_ids="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+              --paginate \
+              --jq '.artifacts[] | select(.name | startswith("encrypted-release-output-")) | .id'
+          )"
+
+          if [ -z "${artifact_ids}" ]; then
+            echo "No encrypted release output artifacts to delete."
+            exit 0
+          fi
+
+          while IFS= read -r artifact_id; do
+            if [ -n "${artifact_id}" ]; then
+              echo "Deleting encrypted release output artifact ${artifact_id}."
+              gh api \
+                --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+            fi
+          done <<< "${artifact_ids}"
