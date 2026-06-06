@@ -60,7 +60,8 @@ jobs:
 
           remote_url="https://github.com/${SOURCE_REPOSITORY}.git"
           refs_file="${RUNNER_TEMP}/private-source-refs.txt"
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${SOURCE_TOKEN}" \
+          auth_header="$(printf 'x-access-token:%s' "${SOURCE_TOKEN}" | base64 | tr -d '\n')"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" \
             ls-remote "${remote_url}" \
               "${source_ref}" \
               "refs/heads/${source_ref}" \
