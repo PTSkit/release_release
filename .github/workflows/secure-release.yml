@@ -19,8 +19,80 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve-source:
+    name: Resolve private source ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+    steps:
+      - name: Resolve private source ref
+        id: resolve
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY || secrets.DESTINATION_REPOSITORY }}
+          SOURCE_REF: ${{ secrets.SOURCE_REF || vars.SOURCE_REF }}
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN || secrets.DESTINATION_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SOURCE_REPOSITORY:-}" ]; then
+            echo "::error::SOURCE_REPOSITORY or DESTINATION_REPOSITORY is required."
+            exit 1
+          fi
+
+          if [ -z "${SOURCE_TOKEN:-}" ]; then
+            echo "::error::SOURCE_TOKEN or DESTINATION_TOKEN is required."
+            exit 1
+          fi
+
+          export GH_TOKEN="${SOURCE_TOKEN}"
+
+          source_ref="${SOURCE_REF:-}"
+          if [ -z "${source_ref}" ]; then
+            source_ref="$(gh repo view "${SOURCE_REPOSITORY}" --json defaultBranchRef --jq '.defaultBranchRef.name')"
+          fi
+
+          if [ -z "${source_ref}" ] || [ "${source_ref}" = "null" ]; then
+            echo "::error::Could not resolve private source ref."
+            exit 1
+          fi
+
+          remote_url="https://github.com/${SOURCE_REPOSITORY}.git"
+          refs_file="${RUNNER_TEMP}/private-source-refs.txt"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${SOURCE_TOKEN}" \
+            ls-remote "${remote_url}" \
+              "${source_ref}" \
+              "refs/heads/${source_ref}" \
+              "refs/tags/${source_ref}" \
+              "refs/tags/${source_ref}^{}" > "${refs_file}"
+
+          source_sha=""
+          for candidate in \
+            "refs/heads/${source_ref}" \
+            "refs/tags/${source_ref}^{}" \
+            "refs/tags/${source_ref}" \
+            "${source_ref}"; do
+            source_sha="$(awk -v ref="${candidate}" '$2 == ref { print $1; exit }' "${refs_file}")"
+            if [ -n "${source_sha}" ]; then
+              break
+            fi
+          done
+
+          if [ -z "${source_sha}" ] && [[ "${source_ref}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            source_sha="${source_ref}"
+          fi
+
+          if [ -z "${source_sha}" ]; then
+            echo "::error::Could not resolve private source SHA."
+            exit 1
+          fi
+
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+
   build:
     name: Private build (${{ matrix.target }})
+    needs: resolve-source
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
@@ -43,6 +115,9 @@ jobs:
       CI_OUTPUT_ENCRYPTED: .ci-output/${{ matrix.target }}/ci-output.log.age
       PRIVATE_BUILD_TARGET: ${{ matrix.target }}
       RELEASE_REF: ${{ inputs.release_ref || github.ref_name }}
+      PRIVATE_SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY || secrets.DESTINATION_REPOSITORY }}
+      PRIVATE_SOURCE_REF: ${{ secrets.SOURCE_REF || vars.SOURCE_REF }}
+      PRIVATE_SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
 
     steps:
       - name: Checkout encrypted source
@@ -141,6 +216,7 @@ jobs:
         shell: bash
         env:
           BUILD_ENV_B64: ${{ secrets.BUILD_ENV_B64 }}
+          PRIVATE_SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN || secrets.DESTINATION_TOKEN }}
         run: |
           set -Eeuo pipefail
           trap 'echo "::error::Build failed. Details are in encrypted CI output."; exit 1' ERR
@@ -263,7 +339,9 @@ jobs:
 
   publish:
     name: Publish release outputs
-    needs: build
+    needs:
+      - resolve-source
+      - build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -272,6 +350,7 @@ jobs:
       CI_OUTPUT_LOG: .ci-output/publish/ci-output.log
       CI_OUTPUT_ENCRYPTED: .ci-output/publish/ci-output.log.age
       RELEASE_REF: ${{ inputs.release_ref || github.ref_name }}
+      SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
     steps:
       - name: Download encrypted release outputs
         uses: actions/download-artifact@v6
@@ -348,6 +427,10 @@ jobs:
             release_target="${DESTINATION_TARGET:-}"
 
             if [ -z "${release_target}" ]; then
+              release_target="${SOURCE_SHA:-}"
+            fi
+
+            if [ -z "${release_target}" ]; then
               release_target="$(gh repo view "${DESTINATION_REPOSITORY}" --json defaultBranchRef --jq '.defaultBranchRef.name')"
             fi
 
@@ -379,7 +462,7 @@ jobs:
                 --repo "${DESTINATION_REPOSITORY}" \
                 --target "${release_target}" \
                 --title "${release_tag}" \
-                --notes "Built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}."; then
+                --notes "Built from private source ${SOURCE_SHA}. Triggered by ${GITHUB_REPOSITORY}@${GITHUB_SHA}."; then
                 gh release view "${release_tag}" --repo "${DESTINATION_REPOSITORY}" >/dev/null
               fi
             fi
