@@ -273,7 +273,8 @@ jobs:
           {
             echo "== encrypt release output =="
             age-keygen -y "${identity_file}" > "${recipient_file}"
-            tar -czf "${archive_file}" -C "${OUTPUT_DIR}" .
+            find "${OUTPUT_DIR}" -type f \( -name '._*' -o -name 'default._*' \) -delete
+            COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -czf "${archive_file}" -C "${OUTPUT_DIR}" .
             age -r "$(cat "${recipient_file}")" -o "${OUTPUT_ARCHIVE_ENCRYPTED}" "${archive_file}"
           } >> "${CI_OUTPUT_LOG}" 2>&1
 
@@ -403,6 +404,7 @@ jobs:
           done
 
           rm -rf "${secure_dir}"
+          find "${PUBLISH_DIR}" -type f \( -name '._*' -o -name 'default._*' \) -delete
 
           if [ -z "$(find "${PUBLISH_DIR}" -type f -print -quit)" ]; then
             echo "::error::Decrypted release outputs are empty."
