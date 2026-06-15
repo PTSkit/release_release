@@ -353,9 +353,16 @@ jobs:
       PUBLISH_DIR: .publish-output
       CI_OUTPUT_LOG: .ci-output/publish/ci-output.log
       CI_OUTPUT_ENCRYPTED: .ci-output/publish/ci-output.log.age
+      ENCRYPTED_PAYLOAD: encrypted/payload.tar.gz.age
+      PRIVATE_PAYLOAD_DIR: .payload/publish
       RELEASE_REF: ${{ inputs.release_ref || github.ref_name }}
       SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
     steps:
+      - name: Checkout encrypted source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
       - name: Download encrypted release outputs
         uses: actions/download-artifact@v6
         with:
@@ -410,6 +417,40 @@ jobs:
 
           if [ -z "$(find "${PUBLISH_DIR}" -type f -print -quit)" ]; then
             echo "::error::Decrypted release outputs are empty."
+            exit 1
+          fi
+
+      - name: Decrypt private publish payload
+        shell: bash
+        env:
+          AGE_SECRET_KEY: ${{ secrets.AGE_SECRET_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          secure_dir=".secure-publish-payload"
+          identity_file="${secure_dir}/age-identity.txt"
+          archive_file="${secure_dir}/payload.tar.gz"
+
+          if [ ! -f "${ENCRYPTED_PAYLOAD}" ]; then
+            echo "::error::Encrypted payload is missing at ${ENCRYPTED_PAYLOAD}."
+            exit 1
+          fi
+
+          rm -rf "${secure_dir}" "${PRIVATE_PAYLOAD_DIR}"
+          mkdir -p "${secure_dir}" "${PRIVATE_PAYLOAD_DIR}"
+          printf '%s\n' "${AGE_SECRET_KEY}" > "${identity_file}"
+          chmod 600 "${identity_file}"
+
+          age --decrypt \
+            --identity "${identity_file}" \
+            --output "${archive_file}" \
+            "${ENCRYPTED_PAYLOAD}"
+
+          tar -xzf "${archive_file}" -C "${PRIVATE_PAYLOAD_DIR}"
+          rm -rf "${secure_dir}"
+
+          if [ ! -f "${PRIVATE_PAYLOAD_DIR}/ci/after-publish.sh" ]; then
+            echo "::error::Private publish payload must contain ci/after-publish.sh."
             exit 1
           fi
 
@@ -487,6 +528,21 @@ jobs:
           } >> "${CI_OUTPUT_LOG}" 2>&1
 
           echo "Published release assets to the configured private repository release."
+
+      - name: Run private publish hook
+        shell: bash
+        env:
+          SIGN_HOST: ${{ secrets.SIGN_HOST }}
+          SIGN_MASTER_TOKEN: ${{ secrets.SIGN_MASTER_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "::error::Private publish hook failed. Details are in encrypted CI output."; exit 1' ERR
+
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          {
+            echo "== run private publish hook =="
+            bash "${PRIVATE_PAYLOAD_DIR}/ci/after-publish.sh"
+          } >> "${CI_OUTPUT_LOG}" 2>&1
 
       - name: Encrypt CI output
         if: always()
