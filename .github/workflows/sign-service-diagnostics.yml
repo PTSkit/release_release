@@ -1,0 +1,378 @@
+name: sign-service-diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_probe:
+        description: Upload a dummy diagnostic package to /packages. It does not update latest_version.
+        required: true
+        type: boolean
+        default: true
+      upload_size_mb:
+        description: Dummy package size in MB. Use 80 to mimic the current macOS arm64 upload.
+        required: true
+        type: string
+        default: "80"
+      curl_max_time:
+        description: Per-request curl max time in seconds.
+        required: true
+        type: string
+        default: "240"
+      origin_ip:
+        description: Optional origin server IP. When set, also tests SIGN_HOST via curl --resolve to bypass CDN/DNS.
+        required: false
+        type: string
+      diagnostic_version:
+        description: Optional package version label. Defaults to diag-<run_id>-<attempt>.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-service-diagnostics-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    name: Diagnose signing service upload path
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CI_OUTPUT_LOG: .ci-output/sign-service-diagnostics/ci-output.log
+      CI_OUTPUT_ENCRYPTED: .ci-output/sign-service-diagnostics/ci-output.log.age
+      SIGN_HOST: ${{ secrets.SIGN_HOST }}
+      SIGN_MASTER_TOKEN: ${{ secrets.SIGN_MASTER_TOKEN }}
+      CI_OUTPUT_AGE_RECIPIENT: ${{ secrets.CI_OUTPUT_AGE_RECIPIENT || vars.CI_OUTPUT_AGE_RECIPIENT }}
+      UPLOAD_PROBE: ${{ inputs.upload_probe }}
+      UPLOAD_SIZE_MB: ${{ inputs.upload_size_mb }}
+      CURL_MAX_TIME: ${{ inputs.curl_max_time }}
+      ORIGIN_IP: ${{ inputs.origin_ip }}
+      DIAGNOSTIC_VERSION: ${{ inputs.diagnostic_version }}
+
+    steps:
+      - name: Checkout encrypted release repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate diagnostic configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          : > "${CI_OUTPUT_LOG}"
+
+          for name in SIGN_HOST SIGN_MASTER_TOKEN CI_OUTPUT_AGE_RECIPIENT; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Required secret or variable ${name} is not configured."
+              exit 1
+            fi
+          done
+
+          case "${UPLOAD_SIZE_MB}" in
+            ""|*[!0-9]*)
+              echo "::error::upload_size_mb must be a positive integer."
+              exit 1
+              ;;
+          esac
+          if [ "${UPLOAD_SIZE_MB}" -lt 1 ] || [ "${UPLOAD_SIZE_MB}" -gt 512 ]; then
+            echo "::error::upload_size_mb must be between 1 and 512."
+            exit 1
+          fi
+
+          case "${CURL_MAX_TIME}" in
+            ""|*[!0-9]*)
+              echo "::error::curl_max_time must be a positive integer."
+              exit 1
+              ;;
+          esac
+          if [ "${CURL_MAX_TIME}" -lt 30 ] || [ "${CURL_MAX_TIME}" -gt 1200 ]; then
+            echo "::error::curl_max_time must be between 30 and 1200."
+            exit 1
+          fi
+
+      - name: Install age
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v age >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq age
+          fi
+          age --version
+
+      - name: Run signing service diagnostics
+        id: diagnostics
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          public_summary="${RUNNER_TEMP}/sign-service-diagnostics-summary.md"
+          result="success"
+
+          sign_host="${SIGN_HOST%/}"
+          case "${sign_host}" in
+            http://*|https://*) ;;
+            *) sign_host="https://${sign_host}" ;;
+          esac
+
+          scheme="${sign_host%%://*}"
+          host_and_path="${sign_host#*://}"
+          host_port="${host_and_path%%/*}"
+          host_name="${host_port%%:*}"
+          if [ "${host_port}" != "${host_name}" ]; then
+            host_port_number="${host_port##*:}"
+          elif [ "${scheme}" = "http" ]; then
+            host_port_number="80"
+          else
+            host_port_number="443"
+          fi
+
+          diagnostic_version="${DIAGNOSTIC_VERSION:-}"
+          if [ -z "${diagnostic_version}" ]; then
+            diagnostic_version="diag-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
+
+          version_endpoint="${sign_host}/admin/client-versions"
+          packages_endpoint="${sign_host}/packages"
+          user_agent="PTSkit Downloader/Bot"
+          work_dir="${RUNNER_TEMP}/sign-service-diagnostics"
+          mkdir -p "${work_dir}"
+
+          log_line() {
+            printf '%s\n' "$*" >> "${CI_OUTPUT_LOG}"
+          }
+
+          log_section() {
+            {
+              printf '\n'
+              printf '== %s ==\n' "$1"
+            } >> "${CI_OUTPUT_LOG}"
+          }
+
+          append_file_excerpt() {
+            local label="$1"
+            local file="$2"
+            local max_bytes="$3"
+
+            log_line "-- ${label} (${file}) --"
+            if [ ! -s "${file}" ]; then
+              log_line "(empty)"
+              return
+            fi
+
+            python3 - "$file" "$max_bytes" >> "${CI_OUTPUT_LOG}" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          max_bytes = int(sys.argv[2])
+          data = path.read_bytes()[:max_bytes]
+          text = data.decode("utf-8", errors="replace")
+          print(text)
+          if path.stat().st_size > max_bytes:
+              print(f"... truncated after {max_bytes} bytes ...")
+          PY
+          }
+
+          run_curl_probe() {
+            local label="$1"
+            local method="$2"
+            local url="$3"
+            shift 3
+
+            local safe_label
+            safe_label="$(printf '%s' "${label}" | tr -c 'A-Za-z0-9_.-' '_')"
+            local headers="${work_dir}/${safe_label}.headers"
+            local body="${work_dir}/${safe_label}.body"
+            local meta="${work_dir}/${safe_label}.meta"
+
+            log_section "curl probe: ${label}"
+            log_line "method=${method}"
+            log_line "url=${url}"
+
+            set +e
+            curl \
+              --show-error \
+              --silent \
+              --location \
+              --max-time "${CURL_MAX_TIME}" \
+              --connect-timeout 30 \
+              --request "${method}" \
+              --header "User-Agent: ${user_agent}" \
+              --header "X-Master-Key: ${SIGN_MASTER_TOKEN}" \
+              --dump-header "${headers}" \
+              --output "${body}" \
+              --write-out $'http_code=%{http_code}\nremote_ip=%{remote_ip}\nlocal_ip=%{local_ip}\ntime_namelookup=%{time_namelookup}\ntime_connect=%{time_connect}\ntime_appconnect=%{time_appconnect}\ntime_pretransfer=%{time_pretransfer}\ntime_starttransfer=%{time_starttransfer}\ntime_total=%{time_total}\nsize_upload=%{size_upload}\nsize_download=%{size_download}\n' \
+              "$@" \
+              "${url}" > "${meta}" 2>> "${CI_OUTPUT_LOG}"
+            local curl_status=$?
+            set -e
+
+            log_line "curl_process_exit=${curl_status}"
+            append_file_excerpt "curl timing" "${meta}" 4096
+            append_file_excerpt "response headers" "${headers}" 8192
+            append_file_excerpt "response body" "${body}" 8192
+
+            local http_code
+            http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' "${meta}" || true)"
+            printf '%s\n' "${curl_status}" > "${work_dir}/${safe_label}.exit"
+            printf '%s\n' "${http_code}" > "${work_dir}/${safe_label}.http"
+          }
+
+          create_probe_file() {
+            local path="$1"
+            log_section "create dummy upload package"
+            log_line "size_mb=${UPLOAD_SIZE_MB}"
+            dd if=/dev/zero of="${path}" bs=1M count="${UPLOAD_SIZE_MB}" status=none
+            ls -lh "${path}" >> "${CI_OUTPUT_LOG}"
+            sha256sum "${path}" >> "${CI_OUTPUT_LOG}"
+          }
+
+          run_route() {
+            local route_name="$1"
+            shift
+            local route_curl_args=("$@")
+
+            log_section "route: ${route_name}"
+            if [ "${#route_curl_args[@]}" -gt 0 ]; then
+              log_line "extra_curl_args=${route_curl_args[*]}"
+            else
+              log_line "extra_curl_args=(none)"
+            fi
+
+            run_curl_probe \
+              "${route_name}-client-version-get" \
+              "GET" \
+              "${version_endpoint}" \
+              "${route_curl_args[@]}"
+
+            run_curl_probe \
+              "${route_name}-packages-validation-post" \
+              "POST" \
+              "${packages_endpoint}" \
+              --fail-with-body \
+              "${route_curl_args[@]}" \
+              --form-string "version=${diagnostic_version}" \
+              --form-string "platform=macOS" \
+              --form-string "arch=arm64" \
+              --form-string "overwrite=true"
+
+            if [ "${UPLOAD_PROBE}" = "true" ]; then
+              local package_file="${work_dir}/PTSkit-Downloader-${diagnostic_version}-${route_name}-${UPLOAD_SIZE_MB}MB.dmg"
+              create_probe_file "${package_file}"
+
+              run_curl_probe \
+                "${route_name}-packages-upload" \
+                "POST" \
+                "${packages_endpoint}" \
+                --fail-with-body \
+                "${route_curl_args[@]}" \
+                --form-string "version=${diagnostic_version}" \
+                --form-string "platform=macOS" \
+                --form-string "arch=arm64" \
+                --form-string "overwrite=true" \
+                --form "file=@${package_file}"
+
+              local safe_upload_label
+              safe_upload_label="$(printf '%s' "${route_name}-packages-upload" | tr -c 'A-Za-z0-9_.-' '_')"
+              local upload_exit upload_http
+              upload_exit="$(cat "${work_dir}/${safe_upload_label}.exit" 2>/dev/null || true)"
+              upload_http="$(cat "${work_dir}/${safe_upload_label}.http" 2>/dev/null || true)"
+
+              {
+                printf -- '- %s upload: HTTP %s, curl exit %s\n' \
+                  "${route_name}" \
+                  "${upload_http:-n/a}" \
+                  "${upload_exit:-n/a}"
+              } >> "${public_summary}"
+
+              if [ "${upload_exit:-1}" != "0" ] || [[ ! "${upload_http:-000}" =~ ^2 ]]; then
+                result="failure"
+              fi
+            fi
+          }
+
+          {
+            printf '### Sign service diagnostics\n'
+            printf -- '- Detailed output is encrypted in the uploaded artifact.\n'
+            printf -- '- Upload probe: %s\n' "${UPLOAD_PROBE}"
+            printf -- '- Upload size: %s MB\n' "${UPLOAD_SIZE_MB}"
+            printf -- '- Version label: %s\n' "${diagnostic_version}"
+          } > "${public_summary}"
+
+          log_section "runner context"
+          {
+            date -u
+            uname -a
+            curl --version
+            printf 'sign_host=%s\n' "${sign_host}"
+            printf 'host_name=%s\n' "${host_name}"
+            printf 'host_port=%s\n' "${host_port_number}"
+            printf 'diagnostic_version=%s\n' "${diagnostic_version}"
+          } >> "${CI_OUTPUT_LOG}"
+
+          log_section "dns"
+          {
+            getent ahosts "${host_name}" || true
+            if command -v nslookup >/dev/null 2>&1; then
+              nslookup "${host_name}" || true
+            fi
+          } >> "${CI_OUTPUT_LOG}" 2>&1
+
+          run_route "default"
+
+          origin_ip="$(printf '%s' "${ORIGIN_IP:-}" | tr -d '[:space:]')"
+          if [ -n "${origin_ip}" ]; then
+            run_route "origin" --resolve "${host_name}:${host_port_number}:${origin_ip}"
+          else
+            printf -- '- Origin bypass: skipped; provide origin_ip to compare direct source behavior.\n' >> "${public_summary}"
+          fi
+
+          {
+            printf '\n'
+            printf 'Diagnostic result: %s\n' "${result}"
+          } >> "${public_summary}"
+
+          cat "${public_summary}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "diagnostic_result=${result}" >> "${GITHUB_OUTPUT}"
+
+      - name: Encrypt diagnostic output
+        if: always()
+        shell: bash
+        env:
+          CI_OUTPUT_AGE_RECIPIENT: ${{ secrets.CI_OUTPUT_AGE_RECIPIENT || vars.CI_OUTPUT_AGE_RECIPIENT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CI_OUTPUT_AGE_RECIPIENT:-}" ]; then
+            echo "::error::Required secret or variable CI_OUTPUT_AGE_RECIPIENT is not configured."
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          if [ ! -s "${CI_OUTPUT_LOG}" ]; then
+            printf 'No captured diagnostic output.\n' > "${CI_OUTPUT_LOG}"
+          fi
+
+          age -r "${CI_OUTPUT_AGE_RECIPIENT}" -o "${CI_OUTPUT_ENCRYPTED}" "${CI_OUTPUT_LOG}"
+          rm -f "${CI_OUTPUT_LOG}"
+
+      - name: Upload encrypted diagnostic output
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: encrypted-ci-output-sign-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CI_OUTPUT_ENCRYPTED }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail when upload probe fails
+        if: ${{ steps.diagnostics.outputs.diagnostic_result != 'success' }}
+        shell: bash
+        run: |
+          echo "::error::Signing service diagnostics found a failing upload path. Download and decrypt the encrypted diagnostic artifact for timing, headers, and response details."
+          exit 1
