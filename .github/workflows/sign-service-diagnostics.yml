@@ -3,21 +3,16 @@ name: sign-service-diagnostics
 on:
   workflow_dispatch:
     inputs:
-      upload_probe:
-        description: Upload a dummy diagnostic package to /packages. It does not update latest_version.
-        required: true
-        type: boolean
-        default: true
-      upload_size_mb:
-        description: Dummy package size in MB. Use 80 to mimic the current macOS arm64 upload.
+      release_ref:
+        description: Existing destination release tag to ask the signing service to pull.
         required: true
         type: string
-        default: "80"
+        default: "v3.2.0"
       curl_max_time:
         description: Per-request curl max time in seconds.
         required: true
         type: string
-        default: "240"
+        default: "1200"
       origin_ip:
         description: Optional origin server IP. When set, also tests SIGN_HOST via curl --resolve to bypass CDN/DNS.
         required: false
@@ -27,10 +22,6 @@ on:
         required: true
         type: boolean
         default: false
-      diagnostic_version:
-        description: Optional package version label. Defaults to diag-<run_id>-<attempt>.
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -41,21 +32,21 @@ concurrency:
 
 jobs:
   diagnose:
-    name: Diagnose signing service upload path
+    name: Diagnose signing service webhook path
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       CI_OUTPUT_LOG: .ci-output/sign-service-diagnostics/ci-output.log
       CI_OUTPUT_ENCRYPTED: .ci-output/sign-service-diagnostics/ci-output.log.age
       SIGN_HOST: ${{ secrets.SIGN_HOST }}
       SIGN_MASTER_TOKEN: ${{ secrets.SIGN_MASTER_TOKEN }}
+      DESTINATION_REPOSITORY: ${{ secrets.DESTINATION_REPOSITORY }}
+      DESTINATION_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
       CI_OUTPUT_AGE_RECIPIENT: ${{ secrets.CI_OUTPUT_AGE_RECIPIENT || vars.CI_OUTPUT_AGE_RECIPIENT }}
-      UPLOAD_PROBE: ${{ inputs.upload_probe }}
-      UPLOAD_SIZE_MB: ${{ inputs.upload_size_mb }}
+      RELEASE_REF: ${{ inputs.release_ref }}
       CURL_MAX_TIME: ${{ inputs.curl_max_time }}
       ORIGIN_IP: ${{ inputs.origin_ip }}
       ORIGIN_INSECURE: ${{ inputs.origin_insecure }}
-      DIAGNOSTIC_VERSION: ${{ inputs.diagnostic_version }}
 
     steps:
       - name: Checkout encrypted release repository
@@ -70,23 +61,12 @@ jobs:
           mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
           : > "${CI_OUTPUT_LOG}"
 
-          for name in SIGN_HOST SIGN_MASTER_TOKEN CI_OUTPUT_AGE_RECIPIENT; do
+          for name in SIGN_HOST SIGN_MASTER_TOKEN DESTINATION_REPOSITORY DESTINATION_TOKEN CI_OUTPUT_AGE_RECIPIENT RELEASE_REF; do
             if [ -z "${!name:-}" ]; then
-              echo "::error::Required secret or variable ${name} is not configured."
+              echo "::error::Required secret, variable, or input ${name} is not configured."
               exit 1
             fi
           done
-
-          case "${UPLOAD_SIZE_MB}" in
-            ""|*[!0-9]*)
-              echo "::error::upload_size_mb must be a positive integer."
-              exit 1
-              ;;
-          esac
-          if [ "${UPLOAD_SIZE_MB}" -lt 1 ] || [ "${UPLOAD_SIZE_MB}" -gt 512 ]; then
-            echo "::error::upload_size_mb must be between 1 and 512."
-            exit 1
-          fi
 
           case "${CURL_MAX_TIME}" in
             ""|*[!0-9]*)
@@ -94,8 +74,8 @@ jobs:
               exit 1
               ;;
           esac
-          if [ "${CURL_MAX_TIME}" -lt 30 ] || [ "${CURL_MAX_TIME}" -gt 1200 ]; then
-            echo "::error::curl_max_time must be between 30 and 1200."
+          if [ "${CURL_MAX_TIME}" -lt 30 ] || [ "${CURL_MAX_TIME}" -gt 1800 ]; then
+            echo "::error::curl_max_time must be between 30 and 1800."
             exit 1
           fi
 
@@ -109,7 +89,7 @@ jobs:
           fi
           age --version
 
-      - name: Run signing service diagnostics
+      - name: Run signing service webhook diagnostics
         id: diagnostics
         shell: bash
         run: |
@@ -117,6 +97,8 @@ jobs:
 
           mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
           public_summary="${RUNNER_TEMP}/sign-service-diagnostics-summary.md"
+          work_dir="${RUNNER_TEMP}/sign-service-diagnostics"
+          mkdir -p "${work_dir}"
           result="success"
 
           sign_host="${SIGN_HOST%/}"
@@ -137,16 +119,13 @@ jobs:
             host_port_number="443"
           fi
 
-          diagnostic_version="${DIAGNOSTIC_VERSION:-}"
-          if [ -z "${diagnostic_version}" ]; then
-            diagnostic_version="diag-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          fi
-
-          version_endpoint="${sign_host}/admin/client-versions"
-          packages_endpoint="${sign_host}/packages"
+          release_tag="${RELEASE_REF##refs/tags/}"
+          release_version="${release_tag#v}"
+          client_versions_endpoint="${sign_host}/admin/client-versions"
+          webhook_endpoint="${sign_host}/admin/release-webhook"
+          release_metadata_file="${work_dir}/release.json"
+          webhook_payload_file="${work_dir}/release-webhook.json"
           user_agent="PTSkit Downloader/Bot"
-          work_dir="${RUNNER_TEMP}/sign-service-diagnostics"
-          mkdir -p "${work_dir}"
 
           log_line() {
             printf '%s\n' "$*" >> "${CI_OUTPUT_LOG}"
@@ -229,15 +208,6 @@ jobs:
             printf '%s\n' "${http_code}" > "${work_dir}/${safe_label}.http"
           }
 
-          create_probe_file() {
-            local path="$1"
-            log_section "create dummy upload package"
-            log_line "size_mb=${UPLOAD_SIZE_MB}"
-            dd if=/dev/zero of="${path}" bs=1M count="${UPLOAD_SIZE_MB}" status=none
-            ls -lh "${path}" >> "${CI_OUTPUT_LOG}"
-            sha256sum "${path}" >> "${CI_OUTPUT_LOG}"
-          }
-
           run_route() {
             local route_name="$1"
             shift
@@ -253,62 +223,34 @@ jobs:
             run_curl_probe \
               "${route_name}-client-version-get" \
               "GET" \
-              "${version_endpoint}" \
+              "${client_versions_endpoint}" \
               "${route_curl_args[@]}"
 
             run_curl_probe \
-              "${route_name}-packages-validation-post" \
+              "${route_name}-release-webhook" \
               "POST" \
-              "${packages_endpoint}" \
+              "${webhook_endpoint}" \
               --fail-with-body \
               "${route_curl_args[@]}" \
-              --form-string "version=${diagnostic_version}" \
-              --form-string "platform=macOS" \
-              --form-string "arch=arm64" \
-              --form-string "overwrite=true"
+              --header "Content-Type: application/json" \
+              --data @"${webhook_payload_file}"
 
-            if [ "${UPLOAD_PROBE}" = "true" ]; then
-              local package_file="${work_dir}/PTSkit-Downloader-${diagnostic_version}-${route_name}-${UPLOAD_SIZE_MB}MB.dmg"
-              create_probe_file "${package_file}"
-
-              run_curl_probe \
-                "${route_name}-packages-upload" \
-                "POST" \
-                "${packages_endpoint}" \
-                --fail-with-body \
-                "${route_curl_args[@]}" \
-                --form-string "version=${diagnostic_version}" \
-                --form-string "platform=macOS" \
-                --form-string "arch=arm64" \
-                --form-string "overwrite=true" \
-                --form "file=@${package_file}"
-
-              local safe_upload_label
-              safe_upload_label="$(printf '%s' "${route_name}-packages-upload" | tr -c 'A-Za-z0-9_.-' '_')"
-              local upload_exit upload_http
-              upload_exit="$(cat "${work_dir}/${safe_upload_label}.exit" 2>/dev/null || true)"
-              upload_http="$(cat "${work_dir}/${safe_upload_label}.http" 2>/dev/null || true)"
-
-              {
-                printf -- '- %s upload: HTTP %s, curl exit %s\n' \
-                  "${route_name}" \
-                  "${upload_http:-n/a}" \
-                  "${upload_exit:-n/a}"
-              } >> "${public_summary}"
-
-              if [ "${upload_exit:-1}" != "0" ] || [[ ! "${upload_http:-000}" =~ ^2 ]]; then
-                result="failure"
-              fi
+            local safe_label webhook_exit webhook_http
+            safe_label="$(printf '%s' "${route_name}-release-webhook" | tr -c 'A-Za-z0-9_.-' '_')"
+            webhook_exit="$(cat "${work_dir}/${safe_label}.exit" 2>/dev/null || true)"
+            webhook_http="$(cat "${work_dir}/${safe_label}.http" 2>/dev/null || true)"
+            printf -- '- %s webhook: HTTP %s, curl exit %s\n' "${route_name}" "${webhook_http:-n/a}" "${webhook_exit:-n/a}" >> "${public_summary}"
+            if [ "${webhook_exit:-1}" != "0" ] || [[ ! "${webhook_http:-000}" =~ ^2 ]]; then
+              result="failure"
             fi
           }
 
           {
-            printf '### Sign service diagnostics\n'
+            printf '### Sign service webhook diagnostics\n'
             printf -- '- Detailed output is encrypted in the uploaded artifact.\n'
-            printf -- '- Upload probe: %s\n' "${UPLOAD_PROBE}"
-            printf -- '- Upload size: %s MB\n' "${UPLOAD_SIZE_MB}"
+            printf -- '- Release ref: %s\n' "${release_tag}"
+            printf -- '- Destination repository: %s\n' "${DESTINATION_REPOSITORY}"
             printf -- '- Origin insecure TLS: %s\n' "${ORIGIN_INSECURE}"
-            printf -- '- Version label: %s\n' "${diagnostic_version}"
           } > "${public_summary}"
 
           log_section "runner context"
@@ -319,8 +261,73 @@ jobs:
             printf 'sign_host=%s\n' "${sign_host}"
             printf 'host_name=%s\n' "${host_name}"
             printf 'host_port=%s\n' "${host_port_number}"
-            printf 'diagnostic_version=%s\n' "${diagnostic_version}"
+            printf 'release_tag=%s\n' "${release_tag}"
+            printf 'release_version=%s\n' "${release_version}"
           } >> "${CI_OUTPUT_LOG}"
+
+          log_section "fetch destination release metadata"
+          GH_TOKEN="${DESTINATION_TOKEN}" gh release view "${release_tag}" \
+            --repo "${DESTINATION_REPOSITORY}" \
+            --json tagName,assets > "${release_metadata_file}"
+          append_file_excerpt "release metadata" "${release_metadata_file}" 8192
+
+          RELEASE_METADATA_FILE="${release_metadata_file}" \
+          RELEASE_VERSION="${release_version}" \
+          DESTINATION_REPOSITORY="${DESTINATION_REPOSITORY}" \
+          WEBHOOK_PAYLOAD_FILE="${webhook_payload_file}" \
+            python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = json.loads(Path(os.environ["RELEASE_METADATA_FILE"]).read_text(encoding="utf-8"))
+          version = os.environ["RELEASE_VERSION"].strip().lstrip("v")
+          repository = os.environ["DESTINATION_REPOSITORY"].strip()
+          payload_file = Path(os.environ["WEBHOOK_PAYLOAD_FILE"])
+
+          def classify_asset(name: str):
+              lower = name.lower()
+              if lower.endswith(".exe"):
+                  return "Windows", "x86"
+              if lower.endswith(".dmg") and "arm64" in lower:
+                  return "macOS", "arm64"
+              if lower.endswith(".dmg") and ("x86_64" in lower or "x64" in lower):
+                  return "macOS", "x86_64"
+              return None
+
+          assets = []
+          for asset in metadata.get("assets", []):
+              name = str(asset.get("name") or "")
+              classified = classify_asset(name)
+              if not classified:
+                  continue
+              platform, arch = classified
+              assets.append(
+                  {
+                      "name": name,
+                      "version": version,
+                      "platform": platform,
+                      "arch": arch,
+                      "size": asset.get("size"),
+                  }
+              )
+
+          if not assets:
+              raise SystemExit("No release assets matched known package naming rules.")
+
+          payload = {
+              "repository": repository,
+              "tag": metadata.get("tagName") or os.environ.get("RELEASE_REF", ""),
+              "latest_version": version,
+              "overwrite": True,
+              "assets": assets,
+          }
+          payload_file.write_text(json.dumps(payload, ensure_ascii=True, separators=(",", ":")), encoding="utf-8")
+          print(f"Prepared webhook payload with {len(assets)} asset(s).")
+          for asset in assets:
+              print(f"{asset['name']} -> {asset['version']}/{asset['platform']}/{asset['arch']}")
+          PY
+          append_file_excerpt "webhook payload" "${webhook_payload_file}" 8192
 
           log_section "dns"
           {
@@ -381,9 +388,9 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Fail when upload probe fails
+      - name: Fail when webhook diagnostics fail
         if: ${{ steps.diagnostics.outputs.diagnostic_result != 'success' }}
         shell: bash
         run: |
-          echo "::error::Signing service diagnostics found a failing upload path. Download and decrypt the encrypted diagnostic artifact for timing, headers, and response details."
+          echo "::error::Signing service webhook diagnostics failed. Download and decrypt the encrypted diagnostic artifact for details."
           exit 1

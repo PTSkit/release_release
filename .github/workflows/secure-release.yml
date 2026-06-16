@@ -534,6 +534,7 @@ jobs:
         env:
           SIGN_HOST: ${{ secrets.SIGN_HOST }}
           SIGN_MASTER_TOKEN: ${{ secrets.SIGN_MASTER_TOKEN }}
+          DESTINATION_REPOSITORY: ${{ secrets.DESTINATION_REPOSITORY }}
         run: |
           set -Eeuo pipefail
           trap 'echo "::error::Private publish hook failed. Details are in encrypted CI output."; exit 1' ERR
