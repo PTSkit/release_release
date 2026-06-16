@@ -503,15 +503,23 @@ jobs:
                 fi
               done
 
+            release_notes="Built from private source ${SOURCE_SHA}. Triggered by ${GITHUB_REPOSITORY}@${GITHUB_SHA}."
+
             if ! gh release view "${release_tag}" --repo "${DESTINATION_REPOSITORY}" >/dev/null 2>&1; then
               if ! gh release create "${release_tag}" \
                 --repo "${DESTINATION_REPOSITORY}" \
                 --target "${release_target}" \
                 --title "${release_tag}" \
-                --notes "Built from private source ${SOURCE_SHA}. Triggered by ${GITHUB_REPOSITORY}@${GITHUB_SHA}."; then
+                --notes "${release_notes}"; then
                 gh release view "${release_tag}" --repo "${DESTINATION_REPOSITORY}" >/dev/null
               fi
             fi
+
+            gh release edit "${release_tag}" \
+              --repo "${DESTINATION_REPOSITORY}" \
+              --target "${release_target}" \
+              --title "${release_tag}" \
+              --notes "${release_notes}"
 
             release_files_file="${RUNNER_TEMP}/release-files.txt"
             find "${PUBLISH_DIR}" -type f -print > "${release_files_file}"
