@@ -163,6 +163,30 @@ jobs:
           PY
           }
 
+          json_response_value() {
+            local response_file="$1"
+            local field_path="$2"
+
+            RESPONSE_FILE="${response_file}" \
+            RESPONSE_FIELD_PATH="${field_path}" \
+              python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          response = json.loads(Path(os.environ["RESPONSE_FILE"]).read_text(encoding="utf-8"))
+          value = response
+          for part in os.environ["RESPONSE_FIELD_PATH"].split("."):
+              if isinstance(value, dict) and part in value:
+                  value = value[part]
+              else:
+                  raise SystemExit(1)
+          if value is None:
+              raise SystemExit(1)
+          print(value)
+          PY
+          }
+
           run_curl_probe() {
             local label="$1"
             local method="$2"
@@ -208,6 +232,71 @@ jobs:
             printf '%s\n' "${http_code}" > "${work_dir}/${safe_label}.http"
           }
 
+          poll_webhook_job() {
+            local route_name="$1"
+            local job_id="$2"
+            shift 2
+            local route_curl_args=("$@")
+            local job_endpoint="${webhook_endpoint}/jobs/${job_id}"
+            local deadline=$((SECONDS + CURL_MAX_TIME))
+            local poll_interval=20
+            local attempt=1
+
+            while true; do
+              local poll_label="${route_name}-release-webhook-job-${attempt}"
+              run_curl_probe \
+                "${poll_label}" \
+                "GET" \
+                "${job_endpoint}" \
+                --fail-with-body \
+                "${route_curl_args[@]}"
+
+              local safe_poll_label poll_exit poll_http poll_body job_status job_error
+              safe_poll_label="$(printf '%s' "${poll_label}" | tr -c 'A-Za-z0-9_.-' '_')"
+              poll_exit="$(cat "${work_dir}/${safe_poll_label}.exit" 2>/dev/null || true)"
+              poll_http="$(cat "${work_dir}/${safe_poll_label}.http" 2>/dev/null || true)"
+              poll_body="${work_dir}/${safe_poll_label}.body"
+
+              if [ "${poll_exit:-1}" != "0" ] || [[ ! "${poll_http:-000}" =~ ^2 ]]; then
+                printf -- '- %s webhook job %s poll failed: HTTP %s, curl exit %s\n' \
+                  "${route_name}" "${job_id}" "${poll_http:-n/a}" "${poll_exit:-n/a}" >> "${public_summary}"
+                return 1
+              fi
+
+              job_status="$(json_response_value "${poll_body}" "job.status" 2>/dev/null || true)"
+              log_line "job_id=${job_id}"
+              log_line "job_status=${job_status:-unknown}"
+
+              case "${job_status}" in
+                success)
+                  printf -- '- %s webhook job %s: success\n' "${route_name}" "${job_id}" >> "${public_summary}"
+                  return 0
+                  ;;
+                failure)
+                  job_error="$(json_response_value "${poll_body}" "job.error" 2>/dev/null || true)"
+                  printf -- '- %s webhook job %s: failure (%s)\n' \
+                    "${route_name}" "${job_id}" "${job_error:-unknown error}" >> "${public_summary}"
+                  return 1
+                  ;;
+                queued|running)
+                  if [ "${SECONDS}" -ge "${deadline}" ]; then
+                    printf -- '- %s webhook job %s: timed out after %ss\n' \
+                      "${route_name}" "${job_id}" "${CURL_MAX_TIME}" >> "${public_summary}"
+                    return 1
+                  fi
+                  sleep "${poll_interval}"
+                  ;;
+                *)
+                  printf -- '- %s webhook job %s: unknown status %s\n' \
+                    "${route_name}" "${job_id}" "${job_status:-empty}" >> "${public_summary}"
+                  return 1
+                  ;;
+              esac
+
+              attempt=$((attempt + 1))
+            done
+          }
+
           run_route() {
             local route_name="$1"
             shift
@@ -241,6 +330,21 @@ jobs:
             webhook_http="$(cat "${work_dir}/${safe_label}.http" 2>/dev/null || true)"
             printf -- '- %s webhook: HTTP %s, curl exit %s\n' "${route_name}" "${webhook_http:-n/a}" "${webhook_exit:-n/a}" >> "${public_summary}"
             if [ "${webhook_exit:-1}" != "0" ] || [[ ! "${webhook_http:-000}" =~ ^2 ]]; then
+              result="failure"
+              return
+            fi
+
+            local webhook_body job_id
+            webhook_body="${work_dir}/${safe_label}.body"
+            job_id="$(json_response_value "${webhook_body}" "job.id" 2>/dev/null || true)"
+            if [ -z "${job_id}" ]; then
+              printf -- '- %s webhook: accepted response did not include job.id\n' "${route_name}" >> "${public_summary}"
+              result="failure"
+              return
+            fi
+
+            printf -- '- %s webhook job: %s\n' "${route_name}" "${job_id}" >> "${public_summary}"
+            if ! poll_webhook_job "${route_name}" "${job_id}" "${route_curl_args[@]}"; then
               result="failure"
             fi
           }
