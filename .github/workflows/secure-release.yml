@@ -614,3 +614,86 @@ jobs:
                 "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
             fi
           done <<< "${artifact_ids}"
+
+  notify-release:
+    name: Send release notification
+    needs:
+      - resolve-source
+      - build
+      - publish
+      - cleanup-release-output-artifacts
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send OneBot group notification
+        shell: bash
+        env:
+          BOT_IP: ${{ secrets.BOT_IP }}
+          BOT_PORT: ${{ secrets.BOT_PORT }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BOT_GROUP_NUMBER: ${{ secrets.BOT_GROUP_NUMBER }}
+          RELEASE_REF: ${{ inputs.release_ref || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESOLVE_RESULT: ${{ needs.resolve-source.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          CLEANUP_RESULT: ${{ needs.cleanup-release-output-artifacts.result }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for name in BOT_IP BOT_PORT BOT_TOKEN BOT_GROUP_NUMBER; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("${name}")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::warning::Skipping release notification because missing secret(s): ${missing[*]}."
+            exit 0
+          fi
+
+          release_status="FAILED"
+          release_summary="Release needs attention."
+          if [ "${PUBLISH_RESULT}" = "success" ]; then
+            release_status="SUCCESS"
+            release_summary="Release completed successfully."
+          fi
+
+          message="[CQ:at,qq=all]
+          secure-release ${release_status}
+          ${release_summary}
+          Repository: ${REPOSITORY}
+          Release: ${RELEASE_REF}
+          Attempt: ${RUN_ATTEMPT}
+          Jobs: resolve=${RESOLVE_RESULT}, build=${BUILD_RESULT}, publish=${PUBLISH_RESULT}, cleanup=${CLEANUP_RESULT}
+          Run: ${RUN_URL}"
+
+          payload_file="${RUNNER_TEMP}/onebot-release-notification.json"
+          BOT_MESSAGE="${message}" python3 - "${payload_file}" <<'PY'
+          import json
+          import os
+          import sys
+
+          payload = {
+              "message_type": "group",
+              "group_id": os.environ["BOT_GROUP_NUMBER"],
+              "message": os.environ["BOT_MESSAGE"],
+          }
+
+          with open(sys.argv[1], "w", encoding="utf-8") as output:
+              json.dump(payload, output, ensure_ascii=False)
+          PY
+
+          endpoint="http://${BOT_IP}:${BOT_PORT}/send_msg"
+          if ! curl --fail-with-body --silent --show-error \
+            --request POST "${endpoint}" \
+            --header "Content-Type: application/json" \
+            --header "Authorization: Bearer ${BOT_TOKEN}" \
+            --data @"${payload_file}"; then
+            echo "::warning::Release notification request failed."
+            exit 0
+          fi
