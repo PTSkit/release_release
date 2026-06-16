@@ -618,11 +618,8 @@ jobs:
   notify-release:
     name: Send release notification
     needs:
-      - resolve-source
-      - build
       - publish
-      - cleanup-release-output-artifacts
-    if: always()
+    if: ${{ needs.publish.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -634,13 +631,6 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           BOT_GROUP_NUMBER: ${{ secrets.BOT_GROUP_NUMBER }}
           RELEASE_REF: ${{ inputs.release_ref || github.ref_name }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          RESOLVE_RESULT: ${{ needs.resolve-source.result }}
-          BUILD_RESULT: ${{ needs.build.result }}
-          PUBLISH_RESULT: ${{ needs.publish.result }}
-          CLEANUP_RESULT: ${{ needs.cleanup-release-output-artifacts.result }}
         run: |
           set -euo pipefail
 
@@ -656,21 +646,7 @@ jobs:
             exit 0
           fi
 
-          release_status="FAILED"
-          release_summary="Release needs attention."
-          if [ "${PUBLISH_RESULT}" = "success" ]; then
-            release_status="SUCCESS"
-            release_summary="Release completed successfully."
-          fi
-
-          message="[CQ:at,qq=all]
-          secure-release ${release_status}
-          ${release_summary}
-          Repository: ${REPOSITORY}
-          Release: ${RELEASE_REF}
-          Attempt: ${RUN_ATTEMPT}
-          Jobs: resolve=${RESOLVE_RESULT}, build=${BUILD_RESULT}, publish=${PUBLISH_RESULT}, cleanup=${CLEANUP_RESULT}
-          Run: ${RUN_URL}"
+          message="$(printf '[CQ:at,qq=all]\n新版本 %s 已发布' "${RELEASE_REF}")"
 
           payload_file="${RUNNER_TEMP}/onebot-release-notification.json"
           BOT_MESSAGE="${message}" python3 - "${payload_file}" <<'PY'
