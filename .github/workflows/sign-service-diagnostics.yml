@@ -22,6 +22,11 @@ on:
         description: Optional origin server IP. When set, also tests SIGN_HOST via curl --resolve to bypass CDN/DNS.
         required: false
         type: string
+      origin_insecure:
+        description: Allow insecure TLS only for the optional origin_ip bypass route.
+        required: true
+        type: boolean
+        default: false
       diagnostic_version:
         description: Optional package version label. Defaults to diag-<run_id>-<attempt>.
         required: false
@@ -49,6 +54,7 @@ jobs:
       UPLOAD_SIZE_MB: ${{ inputs.upload_size_mb }}
       CURL_MAX_TIME: ${{ inputs.curl_max_time }}
       ORIGIN_IP: ${{ inputs.origin_ip }}
+      ORIGIN_INSECURE: ${{ inputs.origin_insecure }}
       DIAGNOSTIC_VERSION: ${{ inputs.diagnostic_version }}
 
     steps:
@@ -301,6 +307,7 @@ jobs:
             printf -- '- Detailed output is encrypted in the uploaded artifact.\n'
             printf -- '- Upload probe: %s\n' "${UPLOAD_PROBE}"
             printf -- '- Upload size: %s MB\n' "${UPLOAD_SIZE_MB}"
+            printf -- '- Origin insecure TLS: %s\n' "${ORIGIN_INSECURE}"
             printf -- '- Version label: %s\n' "${diagnostic_version}"
           } > "${public_summary}"
 
@@ -327,7 +334,11 @@ jobs:
 
           origin_ip="$(printf '%s' "${ORIGIN_IP:-}" | tr -d '[:space:]')"
           if [ -n "${origin_ip}" ]; then
-            run_route "origin" --resolve "${host_name}:${host_port_number}:${origin_ip}"
+            origin_curl_args=(--resolve "${host_name}:${host_port_number}:${origin_ip}")
+            if [ "${ORIGIN_INSECURE}" = "true" ]; then
+              origin_curl_args+=(--insecure)
+            fi
+            run_route "origin" "${origin_curl_args[@]}"
           else
             printf -- '- Origin bypass: skipped; provide origin_ip to compare direct source behavior.\n' >> "${public_summary}"
           fi
