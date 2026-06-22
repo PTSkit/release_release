@@ -1,0 +1,467 @@
+name: sign-service-api-upload-diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign_host:
+        description: Temporary signing service host, for example https://sign.example.com.
+        required: true
+        type: string
+      release_ref:
+        description: Existing destination release tag whose assets should be uploaded through the API.
+        required: true
+        type: string
+        default: "v3.3.0"
+      upload_targets:
+        description: "Comma-separated targets: windows,macos-arm64,macos-x86_64, or all."
+        required: true
+        type: string
+        default: "all"
+      overwrite:
+        description: Overwrite packages already stored on the signing service.
+        required: true
+        type: boolean
+        default: true
+      update_client_version:
+        description: Also update /admin/client-versions latest_version after uploads.
+        required: true
+        type: boolean
+        default: false
+      curl_max_time:
+        description: Per upload curl max time in seconds.
+        required: true
+        type: string
+        default: "1200"
+      insecure:
+        description: Allow insecure TLS for this temporary host test.
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-service-api-upload-diagnostics-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  api-upload:
+    name: Test direct package API upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CI_OUTPUT_LOG: .ci-output/sign-service-api-upload/ci-output.log
+      CI_OUTPUT_ENCRYPTED: .ci-output/sign-service-api-upload/ci-output.log.age
+      TEMP_SIGN_HOST: ${{ inputs.sign_host }}
+      SIGN_MASTER_TOKEN: ${{ secrets.SIGN_MASTER_TOKEN }}
+      DESTINATION_REPOSITORY: ${{ secrets.DESTINATION_REPOSITORY }}
+      DESTINATION_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+      CI_OUTPUT_AGE_RECIPIENT: ${{ secrets.CI_OUTPUT_AGE_RECIPIENT || vars.CI_OUTPUT_AGE_RECIPIENT }}
+      RELEASE_REF: ${{ inputs.release_ref }}
+      UPLOAD_TARGETS: ${{ inputs.upload_targets }}
+      PACKAGE_UPLOAD_OVERWRITE: ${{ inputs.overwrite }}
+      UPDATE_CLIENT_VERSION: ${{ inputs.update_client_version }}
+      CURL_MAX_TIME: ${{ inputs.curl_max_time }}
+      INSECURE_TLS: ${{ inputs.insecure }}
+
+    steps:
+      - name: Checkout release repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate diagnostic configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          : > "${CI_OUTPUT_LOG}"
+
+          for name in TEMP_SIGN_HOST SIGN_MASTER_TOKEN DESTINATION_REPOSITORY DESTINATION_TOKEN CI_OUTPUT_AGE_RECIPIENT RELEASE_REF; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Required input, secret, or variable ${name} is not configured."
+              exit 1
+            fi
+          done
+
+          case "${CURL_MAX_TIME}" in
+            ""|*[!0-9]*)
+              echo "::error::curl_max_time must be a positive integer."
+              exit 1
+              ;;
+          esac
+          if [ "${CURL_MAX_TIME}" -lt 30 ] || [ "${CURL_MAX_TIME}" -gt 1800 ]; then
+            echo "::error::curl_max_time must be between 30 and 1800."
+            exit 1
+          fi
+
+      - name: Install age
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v age >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq age
+          fi
+          age --version
+
+      - name: Run direct API upload diagnostics
+        id: diagnostics
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          public_summary="${RUNNER_TEMP}/sign-service-api-upload-summary.md"
+          work_dir="${RUNNER_TEMP}/sign-service-api-upload"
+          asset_dir="${work_dir}/assets"
+          mkdir -p "${asset_dir}"
+          result="success"
+
+          sign_host="${TEMP_SIGN_HOST%/}"
+          case "${sign_host}" in
+            http://*|https://*) ;;
+            *) sign_host="https://${sign_host}" ;;
+          esac
+
+          release_tag="${RELEASE_REF##refs/tags/}"
+          release_version="${release_tag#v}"
+          packages_endpoint="${sign_host}/packages"
+          client_versions_endpoint="${sign_host}/admin/client-versions"
+          user_agent="PTSkit Downloader/Bot"
+
+          curl_args=(
+            --show-error
+            --silent
+            --location
+            --max-time "${CURL_MAX_TIME}"
+            --connect-timeout 30
+            --retry 5
+            --retry-connrefused
+            --retry-delay 5
+            --header "User-Agent: ${user_agent}"
+            --header "X-Master-Key: ${SIGN_MASTER_TOKEN}"
+          )
+          if [ "${INSECURE_TLS}" = "true" ]; then
+            curl_args+=(--insecure)
+          fi
+
+          log_line() {
+            printf '%s\n' "$*" >> "${CI_OUTPUT_LOG}"
+          }
+
+          log_section() {
+            {
+              printf '\n'
+              printf '== %s ==\n' "$1"
+            } >> "${CI_OUTPUT_LOG}"
+          }
+
+          append_file_excerpt() {
+            local label="$1"
+            local file="$2"
+            local max_bytes="$3"
+
+            log_line "-- ${label} (${file}) --"
+            if [ ! -s "${file}" ]; then
+              log_line "(empty)"
+              return
+            fi
+
+            python3 - "$file" "$max_bytes" >> "${CI_OUTPUT_LOG}" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          max_bytes = int(sys.argv[2])
+          data = path.read_bytes()[:max_bytes]
+          text = data.decode("utf-8", errors="replace")
+          print(text)
+          if path.stat().st_size > max_bytes:
+              print(f"... truncated after {max_bytes} bytes ...")
+          PY
+          }
+
+          check_json_response() {
+            local response_file="$1"
+            local action="$2"
+
+            RESPONSE_FILE="${response_file}" \
+            RESPONSE_ACTION="${action}" \
+              python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          response_text = Path(os.environ["RESPONSE_FILE"]).read_text(encoding="utf-8").strip()
+          if not response_text:
+              raise SystemExit(f"{os.environ['RESPONSE_ACTION']} returned an empty response.")
+
+          response = json.loads(response_text)
+          if isinstance(response, dict) and response.get("success") is False:
+              raise SystemExit(
+                  f"{os.environ['RESPONSE_ACTION']} failed: {response.get('error', 'unknown error')}"
+              )
+          PY
+          }
+
+          classify_target() {
+            local name="$1"
+            local lower
+            lower="$(printf '%s' "${name}" | tr '[:upper:]' '[:lower:]')"
+            case "${lower}" in
+              *.exe)
+                printf 'windows\tWindows\tx86\n'
+                ;;
+              *.dmg)
+                if [[ "${lower}" == *arm64* ]]; then
+                  printf 'macos-arm64\tmacOS\tarm64\n'
+                elif [[ "${lower}" == *x86_64* || "${lower}" == *x64* ]]; then
+                  printf 'macos-x86_64\tmacOS\tx86_64\n'
+                fi
+                ;;
+            esac
+          }
+
+          target_selected() {
+            local target="$1"
+            local requested normalized item
+            requested="${UPLOAD_TARGETS:-all}"
+            normalized="$(printf '%s' "${requested}" | tr '[:upper:]' '[:lower:]' | tr ';' ',')"
+            if [ "${normalized}" = "all" ]; then
+              return 0
+            fi
+            IFS=',' read -ra items <<< "${normalized}"
+            for item in "${items[@]}"; do
+              item="$(printf '%s' "${item}" | xargs)"
+              if [ "${item}" = "${target}" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          log_section "runner context"
+          {
+            date -u
+            uname -a
+            curl --version
+            printf 'sign_host=%s\n' "${sign_host}"
+            printf 'release_tag=%s\n' "${release_tag}"
+            printf 'release_version=%s\n' "${release_version}"
+            printf 'upload_targets=%s\n' "${UPLOAD_TARGETS}"
+            printf 'overwrite=%s\n' "${PACKAGE_UPLOAD_OVERWRITE}"
+            printf 'update_client_version=%s\n' "${UPDATE_CLIENT_VERSION}"
+            printf 'insecure_tls=%s\n' "${INSECURE_TLS}"
+          } >> "${CI_OUTPUT_LOG}"
+
+          {
+            printf '### Sign service direct API upload diagnostics\n'
+            printf -- '- Detailed output is encrypted in the uploaded artifact.\n'
+            printf -- '- Release ref: %s\n' "${release_tag}"
+            printf -- '- Destination repository: %s\n' "${DESTINATION_REPOSITORY}"
+            printf -- '- Host source: workflow input `sign_host`\n'
+            printf -- '- Upload targets: %s\n' "${UPLOAD_TARGETS}"
+            printf -- '- Update latest version: %s\n' "${UPDATE_CLIENT_VERSION}"
+          } > "${public_summary}"
+
+          log_section "download destination release assets"
+          export GH_TOKEN="${DESTINATION_TOKEN}"
+          metadata_file="${work_dir}/release.json"
+          gh release view "${release_tag}" \
+            --repo "${DESTINATION_REPOSITORY}" \
+            --json tagName,assets > "${metadata_file}"
+          append_file_excerpt "release metadata" "${metadata_file}" 8192
+
+          mapfile -t asset_names < <(
+            python3 - "${metadata_file}" "${UPLOAD_TARGETS}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          requested = sys.argv[2].strip().lower().replace(";", ",")
+          selected = None if requested == "all" else {item.strip() for item in requested.split(",") if item.strip()}
+
+          def classify(name: str) -> str | None:
+              lower = name.lower()
+              if lower.endswith(".exe"):
+                  return "windows"
+              if lower.endswith(".dmg") and "arm64" in lower:
+                  return "macos-arm64"
+              if lower.endswith(".dmg") and ("x86_64" in lower or "x64" in lower):
+                  return "macos-x86_64"
+              return None
+
+          for asset in metadata.get("assets", []):
+              name = str(asset.get("name") or "")
+              target = classify(name)
+              if target and (selected is None or target in selected):
+                  print(name)
+          PY
+          )
+
+          if [ "${#asset_names[@]}" -eq 0 ]; then
+            echo "No release assets matched upload_targets=${UPLOAD_TARGETS}." >&2
+            result="failure"
+          else
+            for asset_name in "${asset_names[@]}"; do
+              log_line "Downloading ${asset_name}."
+              gh release download "${release_tag}" \
+                --repo "${DESTINATION_REPOSITORY}" \
+                --pattern "${asset_name}" \
+                --dir "${asset_dir}" \
+                --clobber >> "${CI_OUTPUT_LOG}" 2>&1
+            done
+          fi
+
+          uploaded_count=0
+          if [ "${result}" = "success" ]; then
+            log_section "upload packages through direct API"
+            shopt -s nullglob
+            for package_file in "${asset_dir}"/*; do
+              [ -f "${package_file}" ] || continue
+              package_name="$(basename "${package_file}")"
+              metadata="$(classify_target "${package_name}" || true)"
+              if [ -z "${metadata}" ]; then
+                log_line "Skipping unrecognized asset ${package_name}."
+                continue
+              fi
+              IFS=$'\t' read -r target platform arch <<< "${metadata}"
+              if ! target_selected "${target}"; then
+                log_line "Skipping ${package_name}; target ${target} not requested."
+                continue
+              fi
+
+              response_file="${work_dir}/upload-${uploaded_count}.json"
+              headers_file="${work_dir}/upload-${uploaded_count}.headers"
+              meta_file="${work_dir}/upload-${uploaded_count}.meta"
+              size_bytes="$(stat -c '%s' "${package_file}")"
+              sha256="$(sha256sum "${package_file}" | awk '{print $1}')"
+
+              log_line "Uploading ${package_name} as ${release_version}/${platform}/${arch}."
+              log_line "size=${size_bytes}"
+              log_line "sha256=${sha256}"
+
+              set +e
+              curl "${curl_args[@]}" \
+                --fail-with-body \
+                --request POST \
+                --dump-header "${headers_file}" \
+                --output "${response_file}" \
+                --write-out $'http_code=%{http_code}\nremote_ip=%{remote_ip}\ntime_namelookup=%{time_namelookup}\ntime_connect=%{time_connect}\ntime_appconnect=%{time_appconnect}\ntime_pretransfer=%{time_pretransfer}\ntime_starttransfer=%{time_starttransfer}\ntime_total=%{time_total}\nsize_upload=%{size_upload}\nsize_download=%{size_download}\n' \
+                --form-string "version=${release_version}" \
+                --form-string "platform=${platform}" \
+                --form-string "arch=${arch}" \
+                --form-string "overwrite=${PACKAGE_UPLOAD_OVERWRITE}" \
+                --form "file=@${package_file}" \
+                "${packages_endpoint}" > "${meta_file}" 2>> "${CI_OUTPUT_LOG}"
+              curl_status=$?
+              set -e
+
+              log_line "curl_process_exit=${curl_status}"
+              append_file_excerpt "curl timing" "${meta_file}" 4096
+              append_file_excerpt "response headers" "${headers_file}" 8192
+              append_file_excerpt "response body" "${response_file}" 8192
+
+              http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' "${meta_file}" || true)"
+              printf -- '- %s: HTTP %s, curl exit %s, size %s bytes\n' \
+                "${package_name}" "${http_code:-n/a}" "${curl_status}" "${size_bytes}" >> "${public_summary}"
+
+              if [ "${curl_status}" != "0" ] || [[ ! "${http_code:-000}" =~ ^2 ]]; then
+                result="failure"
+                continue
+              fi
+              if ! check_json_response "${response_file}" "Package upload ${package_name}" >> "${CI_OUTPUT_LOG}" 2>&1; then
+                result="failure"
+                continue
+              fi
+              uploaded_count=$((uploaded_count + 1))
+            done
+          fi
+
+          if [ "${result}" = "success" ] && [ "${uploaded_count}" -eq 0 ]; then
+            log_line "No package files were uploaded."
+            printf -- '- No package files were uploaded.\n' >> "${public_summary}"
+            result="failure"
+          fi
+
+          if [ "${result}" = "success" ] && [ "${UPDATE_CLIENT_VERSION}" = "true" ]; then
+            log_section "update client latest version"
+            update_payload_file="${work_dir}/client-versions-update.json"
+            update_response_file="${work_dir}/client-versions-update-response.json"
+            update_headers_file="${work_dir}/client-versions-update.headers"
+            update_meta_file="${work_dir}/client-versions-update.meta"
+            printf '{"latest_version":"%s"}' "${release_version}" > "${update_payload_file}"
+
+            set +e
+            curl "${curl_args[@]}" \
+              --fail-with-body \
+              --request PUT \
+              --header "Content-Type: application/json" \
+              --dump-header "${update_headers_file}" \
+              --output "${update_response_file}" \
+              --write-out $'http_code=%{http_code}\ntime_total=%{time_total}\nsize_upload=%{size_upload}\nsize_download=%{size_download}\n' \
+              --data @"${update_payload_file}" \
+              "${client_versions_endpoint}" > "${update_meta_file}" 2>> "${CI_OUTPUT_LOG}"
+            update_curl_status=$?
+            set -e
+
+            log_line "client_version_update_curl_process_exit=${update_curl_status}"
+            append_file_excerpt "client version update timing" "${update_meta_file}" 4096
+            append_file_excerpt "client version update response headers" "${update_headers_file}" 8192
+            append_file_excerpt "client version update response body" "${update_response_file}" 8192
+            update_http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' "${update_meta_file}" || true)"
+            printf -- '- client version update: HTTP %s, curl exit %s\n' \
+              "${update_http_code:-n/a}" "${update_curl_status}" >> "${public_summary}"
+            if [ "${update_curl_status}" != "0" ] || [[ ! "${update_http_code:-000}" =~ ^2 ]]; then
+              result="failure"
+            elif ! check_json_response "${update_response_file}" "Client version update" >> "${CI_OUTPUT_LOG}" 2>&1; then
+              result="failure"
+            fi
+          fi
+
+          {
+            printf '\n'
+            printf 'Uploaded package count: %s\n' "${uploaded_count}"
+            printf 'Diagnostic result: %s\n' "${result}"
+          } >> "${public_summary}"
+
+          cat "${public_summary}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "diagnostic_result=${result}" >> "${GITHUB_OUTPUT}"
+
+      - name: Encrypt diagnostic output
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CI_OUTPUT_AGE_RECIPIENT:-}" ]; then
+            echo "::error::Required secret or variable CI_OUTPUT_AGE_RECIPIENT is not configured."
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
+          if [ ! -s "${CI_OUTPUT_LOG}" ]; then
+            printf 'No captured diagnostic output.\n' > "${CI_OUTPUT_LOG}"
+          fi
+
+          age -r "${CI_OUTPUT_AGE_RECIPIENT}" -o "${CI_OUTPUT_ENCRYPTED}" "${CI_OUTPUT_LOG}"
+          rm -f "${CI_OUTPUT_LOG}"
+
+      - name: Upload encrypted diagnostic output
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: encrypted-ci-output-api-upload-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CI_OUTPUT_ENCRYPTED }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail when direct API upload diagnostics fail
+        if: ${{ steps.diagnostics.outputs.diagnostic_result != 'success' }}
+        shell: bash
+        run: |
+          echo "::error::Direct API upload diagnostics failed. Download and decrypt the encrypted diagnostic artifact for details."
+          exit 1
