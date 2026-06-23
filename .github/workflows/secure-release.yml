@@ -537,19 +537,18 @@ jobs:
 
           echo "Published release assets to the configured private repository release."
 
-      - name: Run private publish hook
+      - name: Upload packages to signing service
         shell: bash
         env:
           SIGN_HOST: ${{ secrets.SIGN_HOST }}
           SIGN_MASTER_TOKEN: ${{ secrets.SIGN_MASTER_TOKEN }}
-          DESTINATION_REPOSITORY: ${{ secrets.DESTINATION_REPOSITORY }}
         run: |
           set -Eeuo pipefail
-          trap 'echo "::error::Private publish hook failed. Details are in encrypted CI output."; exit 1' ERR
+          trap 'echo "::error::Signing service package upload failed. Details are in encrypted CI output."; exit 1' ERR
 
           mkdir -p "$(dirname "${CI_OUTPUT_LOG}")"
           {
-            echo "== run private publish hook =="
+            echo "== upload packages to signing service =="
             bash "${PRIVATE_PAYLOAD_DIR}/ci/after-publish.sh"
           } >> "${CI_OUTPUT_LOG}" 2>&1
 
