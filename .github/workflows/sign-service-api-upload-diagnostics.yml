@@ -32,6 +32,11 @@ on:
         required: true
         type: string
         default: "1200"
+      chunk_size_bytes:
+        description: Per upload chunk size in bytes.
+        required: true
+        type: string
+        default: "52428800"
       insecure:
         description: Allow insecure TLS for this temporary host test.
         required: true
@@ -47,7 +52,7 @@ concurrency:
 
 jobs:
   api-upload:
-    name: Test direct package API upload
+    name: Test chunked package API upload
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -63,6 +68,7 @@ jobs:
       PACKAGE_UPLOAD_OVERWRITE: ${{ inputs.overwrite }}
       UPDATE_CLIENT_VERSION: ${{ inputs.update_client_version }}
       CURL_MAX_TIME: ${{ inputs.curl_max_time }}
+      PACKAGE_UPLOAD_CHUNK_SIZE_BYTES: ${{ inputs.chunk_size_bytes }}
       INSECURE_TLS: ${{ inputs.insecure }}
 
     steps:
@@ -96,6 +102,17 @@ jobs:
             exit 1
           fi
 
+          case "${PACKAGE_UPLOAD_CHUNK_SIZE_BYTES}" in
+            ""|*[!0-9]*)
+              echo "::error::chunk_size_bytes must be a positive integer."
+              exit 1
+              ;;
+          esac
+          if [ "${PACKAGE_UPLOAD_CHUNK_SIZE_BYTES}" -lt 1048576 ] || [ "${PACKAGE_UPLOAD_CHUNK_SIZE_BYTES}" -gt 94371840 ]; then
+            echo "::error::chunk_size_bytes must be between 1048576 and 94371840."
+            exit 1
+          fi
+
       - name: Install age
         shell: bash
         run: |
@@ -106,7 +123,7 @@ jobs:
           fi
           age --version
 
-      - name: Run direct API upload diagnostics
+      - name: Run chunked API upload diagnostics
         id: diagnostics
         shell: bash
         run: |
@@ -127,7 +144,7 @@ jobs:
 
           release_tag="${RELEASE_REF##refs/tags/}"
           release_version="${release_tag#v}"
-          packages_endpoint="${sign_host}/packages"
+          chunked_uploads_endpoint="${sign_host}/packages/chunked-uploads"
           client_versions_endpoint="${sign_host}/admin/client-versions"
           user_agent="PTSkit Downloader/Bot"
 
@@ -206,6 +223,30 @@ jobs:
           PY
           }
 
+          json_response_value() {
+            local response_file="$1"
+            local field_path="$2"
+
+            RESPONSE_FILE="${response_file}" \
+            RESPONSE_FIELD_PATH="${field_path}" \
+              python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          response = json.loads(Path(os.environ["RESPONSE_FILE"]).read_text(encoding="utf-8"))
+          value = response
+          for part in os.environ["RESPONSE_FIELD_PATH"].split("."):
+              if isinstance(value, dict) and part in value:
+                  value = value[part]
+              else:
+                  raise SystemExit(1)
+          if value is None:
+              raise SystemExit(1)
+          print(value)
+          PY
+          }
+
           classify_target() {
             local name="$1"
             local lower
@@ -242,6 +283,153 @@ jobs:
             return 1
           }
 
+          write_chunked_upload_init_payload() {
+            local package_file="$1"
+            local platform="$2"
+            local arch="$3"
+            local init_payload_file="$4"
+
+            RELEASE_VERSION="${release_version}" \
+            PACKAGE_FILE="${package_file}" \
+            PACKAGE_PLATFORM="${platform}" \
+            PACKAGE_ARCH="${arch}" \
+            PACKAGE_OVERWRITE="${PACKAGE_UPLOAD_OVERWRITE}" \
+            PACKAGE_CHUNK_SIZE="${PACKAGE_UPLOAD_CHUNK_SIZE_BYTES}" \
+            INIT_PAYLOAD_FILE="${init_payload_file}" \
+              python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          package_file = Path(os.environ["PACKAGE_FILE"])
+          chunk_size = int(os.environ["PACKAGE_CHUNK_SIZE"])
+          hasher = hashlib.sha256()
+          with package_file.open("rb") as f:
+              for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                  hasher.update(chunk)
+          payload = {
+              "version": os.environ["RELEASE_VERSION"].strip().lstrip("v"),
+              "platform": os.environ["PACKAGE_PLATFORM"],
+              "arch": os.environ["PACKAGE_ARCH"],
+              "filename": package_file.name,
+              "size": package_file.stat().st_size,
+              "sha256": hasher.hexdigest(),
+              "chunk_size": chunk_size,
+              "overwrite": os.environ.get("PACKAGE_OVERWRITE", "true").strip().lower() == "true",
+          }
+          Path(os.environ["INIT_PAYLOAD_FILE"]).write_text(
+              json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          print(f"{payload['size']} {payload['sha256']}")
+          PY
+          }
+
+          upload_package_chunked() {
+            local package_file="$1"
+            local platform="$2"
+            local arch="$3"
+            local upload_index="$4"
+
+            local package_name init_payload_file init_response_file init_headers_file init_meta_file
+            local upload_id server_chunk_size part_dir complete_response_file complete_headers_file complete_meta_file
+            package_name="$(basename "${package_file}")"
+            init_payload_file="${work_dir}/upload-${upload_index}-init.json"
+            init_response_file="${work_dir}/upload-${upload_index}-init-response.json"
+            init_headers_file="${work_dir}/upload-${upload_index}-init.headers"
+            init_meta_file="${work_dir}/upload-${upload_index}-init.meta"
+            part_dir="${work_dir}/upload-${upload_index}-parts"
+            complete_response_file="${work_dir}/upload-${upload_index}-complete-response.json"
+            complete_headers_file="${work_dir}/upload-${upload_index}-complete.headers"
+            complete_meta_file="${work_dir}/upload-${upload_index}-complete.meta"
+
+            log_line "Initializing chunked upload for ${package_name}."
+            write_chunked_upload_init_payload "${package_file}" "${platform}" "${arch}" "${init_payload_file}" >> "${CI_OUTPUT_LOG}" 2>&1
+            set +e
+            curl "${curl_args[@]}" \
+              --fail-with-body \
+              --request POST \
+              --header "Content-Type: application/json" \
+              --dump-header "${init_headers_file}" \
+              --output "${init_response_file}" \
+              --write-out $'http_code=%{http_code}\nremote_ip=%{remote_ip}\ntime_total=%{time_total}\nsize_upload=%{size_upload}\nsize_download=%{size_download}\n' \
+              --data @"${init_payload_file}" \
+              "${chunked_uploads_endpoint}" > "${init_meta_file}" 2>> "${CI_OUTPUT_LOG}"
+            init_curl_status=$?
+            set -e
+            log_line "chunked_init_curl_process_exit=${init_curl_status}"
+            append_file_excerpt "chunked init timing" "${init_meta_file}" 4096
+            append_file_excerpt "chunked init response headers" "${init_headers_file}" 8192
+            append_file_excerpt "chunked init response body" "${init_response_file}" 8192
+            init_http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' "${init_meta_file}" || true)"
+            if [ "${init_curl_status}" != "0" ] || [[ ! "${init_http_code:-000}" =~ ^2 ]]; then
+              return 1
+            fi
+            check_json_response "${init_response_file}" "Chunked upload init ${package_name}" >> "${CI_OUTPUT_LOG}" 2>&1
+            upload_id="$(json_response_value "${init_response_file}" "upload.id")"
+            server_chunk_size="$(json_response_value "${init_response_file}" "upload.chunk_size")"
+
+            rm -rf "${part_dir}"
+            mkdir -p "${part_dir}"
+            split -b "${server_chunk_size}" -d -a 6 "${package_file}" "${part_dir}/part-"
+            mapfile -t part_files < <(find "${part_dir}" -maxdepth 1 -type f -name 'part-*' | sort)
+            if [ "${#part_files[@]}" -eq 0 ]; then
+              log_line "No split parts were produced for ${package_name}."
+              return 1
+            fi
+
+            local part_index=0
+            local part_file part_response_file part_headers_file part_meta_file part_curl_status part_http_code
+            for part_file in "${part_files[@]}"; do
+              part_response_file="${work_dir}/upload-${upload_index}-part-${part_index}.json"
+              part_headers_file="${work_dir}/upload-${upload_index}-part-${part_index}.headers"
+              part_meta_file="${work_dir}/upload-${upload_index}-part-${part_index}.meta"
+              log_line "Uploading chunk ${part_index}/${#part_files[@]} for ${package_name} ($(stat -c '%s' "${part_file}") bytes)."
+              set +e
+              curl "${curl_args[@]}" \
+                --fail-with-body \
+                --request POST \
+                --dump-header "${part_headers_file}" \
+                --output "${part_response_file}" \
+                --write-out $'http_code=%{http_code}\nremote_ip=%{remote_ip}\ntime_total=%{time_total}\nsize_upload=%{size_upload}\nsize_download=%{size_download}\n' \
+                --form "file=@${part_file}" \
+                "${chunked_uploads_endpoint}/${upload_id}/parts/${part_index}" > "${part_meta_file}" 2>> "${CI_OUTPUT_LOG}"
+              part_curl_status=$?
+              set -e
+              log_line "chunked_part_${part_index}_curl_process_exit=${part_curl_status}"
+              append_file_excerpt "chunked part ${part_index} timing" "${part_meta_file}" 4096
+              append_file_excerpt "chunked part ${part_index} response headers" "${part_headers_file}" 4096
+              append_file_excerpt "chunked part ${part_index} response body" "${part_response_file}" 4096
+              part_http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' "${part_meta_file}" || true)"
+              if [ "${part_curl_status}" != "0" ] || [[ ! "${part_http_code:-000}" =~ ^2 ]]; then
+                return 1
+              fi
+              check_json_response "${part_response_file}" "Chunked upload part ${part_index} ${package_name}" >> "${CI_OUTPUT_LOG}" 2>&1
+              part_index=$((part_index + 1))
+            done
+
+            set +e
+            curl "${curl_args[@]}" \
+              --fail-with-body \
+              --request POST \
+              --dump-header "${complete_headers_file}" \
+              --output "${complete_response_file}" \
+              --write-out $'http_code=%{http_code}\nremote_ip=%{remote_ip}\ntime_total=%{time_total}\nsize_upload=%{size_upload}\nsize_download=%{size_download}\n' \
+              "${chunked_uploads_endpoint}/${upload_id}/complete" > "${complete_meta_file}" 2>> "${CI_OUTPUT_LOG}"
+            complete_curl_status=$?
+            set -e
+            log_line "chunked_complete_curl_process_exit=${complete_curl_status}"
+            append_file_excerpt "chunked complete timing" "${complete_meta_file}" 4096
+            append_file_excerpt "chunked complete response headers" "${complete_headers_file}" 8192
+            append_file_excerpt "chunked complete response body" "${complete_response_file}" 8192
+            complete_http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' "${complete_meta_file}" || true)"
+            if [ "${complete_curl_status}" != "0" ] || [[ ! "${complete_http_code:-000}" =~ ^2 ]]; then
+              return 1
+            fi
+            check_json_response "${complete_response_file}" "Chunked upload complete ${package_name}" >> "${CI_OUTPUT_LOG}" 2>&1
+          }
+
           log_section "runner context"
           {
             date -u
@@ -253,16 +441,18 @@ jobs:
             printf 'upload_targets=%s\n' "${UPLOAD_TARGETS}"
             printf 'overwrite=%s\n' "${PACKAGE_UPLOAD_OVERWRITE}"
             printf 'update_client_version=%s\n' "${UPDATE_CLIENT_VERSION}"
+            printf 'chunk_size_bytes=%s\n' "${PACKAGE_UPLOAD_CHUNK_SIZE_BYTES}"
             printf 'insecure_tls=%s\n' "${INSECURE_TLS}"
           } >> "${CI_OUTPUT_LOG}"
 
           {
-            printf '### Sign service direct API upload diagnostics\n'
+            printf '### Sign service chunked API upload diagnostics\n'
             printf -- '- Detailed output is encrypted in the uploaded artifact.\n'
             printf -- '- Release ref: %s\n' "${release_tag}"
             printf -- '- Destination repository: %s\n' "${DESTINATION_REPOSITORY}"
             printf -- '- Host source: workflow input `sign_host`\n'
             printf -- '- Upload targets: %s\n' "${UPLOAD_TARGETS}"
+            printf -- '- Chunk size: %s bytes\n' "${PACKAGE_UPLOAD_CHUNK_SIZE_BYTES}"
             printf -- '- Update latest version: %s\n' "${UPDATE_CLIENT_VERSION}"
           } > "${public_summary}"
 
@@ -318,7 +508,7 @@ jobs:
 
           uploaded_count=0
           if [ "${result}" = "success" ]; then
-            log_section "upload packages through direct API"
+            log_section "upload packages through chunked API"
             shopt -s nullglob
             for package_file in "${asset_dir}"/*; do
               [ -f "${package_file}" ] || continue
@@ -334,9 +524,6 @@ jobs:
                 continue
               fi
 
-              response_file="${work_dir}/upload-${uploaded_count}.json"
-              headers_file="${work_dir}/upload-${uploaded_count}.headers"
-              meta_file="${work_dir}/upload-${uploaded_count}.meta"
               size_bytes="$(stat -c '%s' "${package_file}")"
               sha256="$(sha256sum "${package_file}" | awk '{print $1}')"
 
@@ -344,36 +531,17 @@ jobs:
               log_line "size=${size_bytes}"
               log_line "sha256=${sha256}"
 
-              set +e
-              curl "${curl_args[@]}" \
-                --fail-with-body \
-                --request POST \
-                --dump-header "${headers_file}" \
-                --output "${response_file}" \
-                --write-out $'http_code=%{http_code}\nremote_ip=%{remote_ip}\ntime_namelookup=%{time_namelookup}\ntime_connect=%{time_connect}\ntime_appconnect=%{time_appconnect}\ntime_pretransfer=%{time_pretransfer}\ntime_starttransfer=%{time_starttransfer}\ntime_total=%{time_total}\nsize_upload=%{size_upload}\nsize_download=%{size_download}\n' \
-                --form-string "version=${release_version}" \
-                --form-string "platform=${platform}" \
-                --form-string "arch=${arch}" \
-                --form-string "overwrite=${PACKAGE_UPLOAD_OVERWRITE}" \
-                --form "file=@${package_file}" \
-                "${packages_endpoint}" > "${meta_file}" 2>> "${CI_OUTPUT_LOG}"
-              curl_status=$?
-              set -e
-
-              log_line "curl_process_exit=${curl_status}"
-              append_file_excerpt "curl timing" "${meta_file}" 4096
-              append_file_excerpt "response headers" "${headers_file}" 8192
-              append_file_excerpt "response body" "${response_file}" 8192
-
-              http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' "${meta_file}" || true)"
+              if upload_package_chunked "${package_file}" "${platform}" "${arch}" "${uploaded_count}"; then
+                curl_status=0
+                http_code=200
+              else
+                curl_status=1
+                http_code=000
+              fi
               printf -- '- %s: HTTP %s, curl exit %s, size %s bytes\n' \
                 "${package_name}" "${http_code:-n/a}" "${curl_status}" "${size_bytes}" >> "${public_summary}"
 
-              if [ "${curl_status}" != "0" ] || [[ ! "${http_code:-000}" =~ ^2 ]]; then
-                result="failure"
-                continue
-              fi
-              if ! check_json_response "${response_file}" "Package upload ${package_name}" >> "${CI_OUTPUT_LOG}" 2>&1; then
+              if [ "${curl_status}" != "0" ]; then
                 result="failure"
                 continue
               fi
@@ -459,9 +627,9 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Fail when direct API upload diagnostics fail
+      - name: Fail when chunked API upload diagnostics fail
         if: ${{ steps.diagnostics.outputs.diagnostic_result != 'success' }}
         shell: bash
         run: |
-          echo "::error::Direct API upload diagnostics failed. Download and decrypt the encrypted diagnostic artifact for details."
+          echo "::error::Chunked API upload diagnostics failed. Download and decrypt the encrypted diagnostic artifact for details."
           exit 1
